@@ -8,7 +8,7 @@ const wallet = vi.hoisted(() => ({
   getWalletNetwork: vi.fn(),
   signTransaction: vi.fn(),
 }));
-const apiMock = vi.hoisted(() => ({ getLink: vi.fn(), submitPayment: vi.fn() }));
+const apiMock = vi.hoisted(() => ({ getLink: vi.fn(), submitPayment: vi.fn(), getPayOptions: vi.fn() }));
 const sdk = vi.hoisted(() => ({ loadAccount: vi.fn(), memos: [] as string[] }));
 
 vi.mock("../lib/wallet", () => ({
@@ -50,8 +50,9 @@ vi.mock("@stellar/stellar-sdk", () => {
   };
 });
 
-import WalletPayButton from "../app/components/WalletPayButton";
-import { CheckoutError, type LinkWithRequest } from "../lib/api";
+import WalletPayButton, { type PaymentBuildContext } from "../app/components/WalletPayButton";
+import { countdownMilestone } from "../app/components/PayWithChoice";
+import { CheckoutError, type LinkWithRequest, type PayOption } from "../lib/api";
 
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -71,6 +72,18 @@ function link(over: Partial<LinkWithRequest["link"]> = {}): LinkWithRequest {
   } as unknown as LinkWithRequest;
 }
 
+/** A quoted path-payment option: 10 USDC is worth about 24.12 XLM to this buyer. */
+const XLM_OPTION: PayOption = {
+  asset: { code: "XLM", issuer: null },
+  sourceAmount: "24.12",
+  maxSourceAmount: "24.36",
+};
+
+/** The same link, but with the pay-in-any-asset flag on. */
+function pathLink(over: Partial<LinkWithRequest["link"]> = {}): LinkWithRequest {
+  return { ...link(over), pay: { pathPayments: true, maxSlippageBps: 100 } };
+}
+
 const fundedAccount = {
   sequence: "100",
   balances: [
@@ -84,8 +97,13 @@ describe("WalletPayButton", () => {
   let root: Root;
   const onSubmitted = vi.fn();
 
-  async function mount(initial: LinkWithRequest = link()) {
-    await act(async () => root.render(<WalletPayButton initial={initial} onSubmitted={onSubmitted} />));
+  async function mount(
+    initial: LinkWithRequest = link(),
+    props: { buildTransaction?: (context: PaymentBuildContext) => Promise<string> } = {},
+  ) {
+    await act(async () =>
+      root.render(<WalletPayButton initial={initial} onSubmitted={onSubmitted} {...props} />),
+    );
   }
   async function pay() {
     const button = container.querySelector("button")!;
@@ -101,8 +119,10 @@ describe("WalletPayButton", () => {
     wallet.connectWallet.mockResolvedValue("GBUYER");
     wallet.getWalletNetwork.mockResolvedValue({ network: "TESTNET", networkPassphrase: PASSPHRASE });
     wallet.signTransaction.mockResolvedValue("SIGNED_XDR");
+    vi.useRealTimers();
     apiMock.getLink.mockResolvedValue(link());
     apiMock.submitPayment.mockResolvedValue({ txHash: "tx_abc" });
+    apiMock.getPayOptions.mockResolvedValue([]);
     sdk.loadAccount.mockResolvedValue(fundedAccount);
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -111,6 +131,7 @@ describe("WalletPayButton", () => {
   afterEach(async () => {
     await act(async () => root.unmount());
     container.remove();
+    vi.useRealTimers();
   });
 
   it("renders the cancelled copy when the wallet is dismissed at connect", async () => {
@@ -240,5 +261,145 @@ describe("WalletPayButton", () => {
   it("is disabled when told to be", async () => {
     await act(async () => root.render(<WalletPayButton initial={link()} disabled onSubmitted={onSubmitted} />));
     expect(container.querySelector("button")!.disabled).toBe(true);
+  });
+
+  // ── Pay-with choice (issue 5.47) ─────────────────────────────────────────
+
+  describe("pay-with choice", () => {
+    const choiceGroup = () => container.querySelector("fieldset.pay-choice");
+    const radios = () => Array.from(container.querySelectorAll<HTMLInputElement>('input[name="payAsset"]'));
+    const liveRegion = () => container.querySelector('.pay-choice [aria-live="polite"]');
+    const payButtonText = () => container.querySelector("button")?.textContent;
+
+    it.each([
+      ["missing", undefined],
+      ["false", { pathPayments: false, maxSlippageBps: 100 }],
+    ])("keeps the existing payment when pay.pathPayments is %s", async (_label, payFlag) => {
+      apiMock.getPayOptions.mockResolvedValue([XLM_OPTION]);
+      await mount({ ...link(), pay: payFlag as unknown as LinkWithRequest["pay"] });
+      await pay();
+
+      expect(choiceGroup()).toBeNull();
+      expect(apiMock.getPayOptions).not.toHaveBeenCalled();
+      expect(onSubmitted).toHaveBeenCalledWith("tx_abc");
+    });
+
+    it("keeps the existing payment when the API quotes no other asset", async () => {
+      apiMock.getPayOptions.mockResolvedValue([]);
+      await mount(pathLink());
+      await pay();
+
+      expect(apiMock.getPayOptions).toHaveBeenCalledWith("lnk_1", "GBUYER");
+      expect(choiceGroup()).toBeNull();
+      expect(onSubmitted).toHaveBeenCalledWith("tx_abc");
+    });
+
+    it("lists the link asset first, then each quoted asset, and pays with the chosen one", async () => {
+      apiMock.getPayOptions.mockResolvedValue([XLM_OPTION]);
+      const build = vi.fn().mockResolvedValue("UNSIGNED_XDR");
+      await mount(pathLink(), { buildTransaction: build });
+      await pay();
+
+      const group = choiceGroup() as HTMLElement;
+      expect(group.querySelector("legend")?.textContent).toBe("Pay with");
+      expect(radios().map((radio) => radio.closest("label")!.textContent)).toEqual([
+        "10 USDC",
+        "about 24.12 XLM, at most 24.36 XLM",
+      ]);
+      // One radio group: the shared name is what gives arrow-key navigation.
+      expect(radios().map((radio) => radio.name)).toEqual(["payAsset", "payAsset"]);
+      expect(radios()[0]!.checked).toBe(true);
+      expect(group.textContent).toContain("The QR code above always pays in USDC.");
+      expect(liveRegion()).toBeTruthy();
+      // Nothing is built or signed until the buyer confirms the choice.
+      expect(build).not.toHaveBeenCalled();
+      expect(payButtonText()).toBe("Pay with USDC");
+
+      await act(async () => radios()[1]!.click());
+      expect(payButtonText()).toBe("Pay with XLM");
+
+      await pay();
+      expect(build).toHaveBeenCalledWith(
+        expect.objectContaining({
+          address: "GBUYER",
+          payOption: expect.objectContaining({ asset: { code: "XLM", issuer: null } }),
+        }),
+      );
+      expect(onSubmitted).toHaveBeenCalledWith("tx_abc");
+    });
+
+    it("refuses a chosen foreign asset instead of quietly charging the link asset", async () => {
+      // 5.48 owns the path payment. Until it lands the default builder must not
+      // fall back to the link asset: the buyer picked XLM and must be told so.
+      apiMock.getPayOptions.mockResolvedValue([XLM_OPTION]);
+      await mount(pathLink());
+      await pay();
+      await act(async () => radios()[1]!.click());
+      await pay();
+
+      expect(alertText()).toContain("Paying in XLM isn't available yet");
+      expect(alertText()).toContain("Choose USDC to pay now");
+      expect(wallet.signTransaction).not.toHaveBeenCalled();
+      expect(apiMock.submitPayment).not.toHaveBeenCalled();
+      // The choice is still on screen and still selected.
+      expect(radios()[1]!.checked).toBe(true);
+    });
+
+    it("keeps the chosen asset when the re-quote request fails, rather than reverting to the link asset", async () => {
+      vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+      apiMock.getPayOptions
+        .mockResolvedValueOnce([{ ...XLM_OPTION, expiresAt: Date.now() + 2_000 }])
+        .mockRejectedValueOnce(new Error("quote service down"));
+      await mount(pathLink());
+      await pay();
+      await act(async () => radios()[1]!.click());
+
+      await act(async () => {
+        vi.advanceTimersByTime(3_000);
+      });
+      await act(async () => {});
+      await act(async () => {});
+
+      expect(apiMock.getPayOptions).toHaveBeenCalledTimes(2);
+      expect(radios()[1]!.checked).toBe(true);
+      expect(radios()[0]!.checked).toBe(false);
+      expect(payButtonText()).toBe("Pay with XLM");
+    });
+
+    it("counts the quote down and re-quotes when it expires, keeping the chosen asset", async () => {
+      vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
+      apiMock.getPayOptions
+        .mockResolvedValueOnce([{ ...XLM_OPTION, expiresAt: Date.now() + 2_000 }])
+        .mockResolvedValueOnce([
+          { ...XLM_OPTION, sourceAmount: "24.20", maxSourceAmount: "24.44", expiresAt: Date.now() + 120_000 },
+        ]);
+      await mount(pathLink());
+      await pay();
+      await act(async () => radios()[1]!.click());
+
+      expect(container.textContent).toContain("Quote valid for 0:02");
+      // Two seconds left is inside the 10-second threshold, so the live region
+      // says so once — the per-second tick itself is silent.
+      expect(liveRegion()?.textContent).toContain("under 10 seconds");
+
+      await act(async () => {
+        vi.advanceTimersByTime(3_000);
+      });
+      await act(async () => {});
+      await act(async () => {});
+
+      expect(apiMock.getPayOptions).toHaveBeenCalledTimes(2);
+      expect(container.textContent).toContain("about 24.20 XLM, at most 24.44 XLM");
+      expect(radios()[1]!.checked).toBe(true);
+      expect(container.textContent).not.toContain("Quote expired");
+    });
+
+    it("only announces the countdown at thresholds, not every second", () => {
+      expect(countdownMilestone(120_000)).toBeNull();
+      expect(countdownMilestone(45_000)).toContain("under a minute");
+      expect(countdownMilestone(20_000)).toContain("under 30 seconds");
+      expect(countdownMilestone(5_000)).toContain("under 10 seconds");
+      expect(countdownMilestone(0)).toContain("expired");
+    });
   });
 });
