@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { Keypair } from "@stellar/stellar-sdk";
 import {
   resolveStellarConfig,
+  realHorizonClient,
   StellarRail,
   HorizonWatcher,
   StreamingHorizonWatcher,
@@ -64,6 +65,7 @@ import {
   DrizzleRefundRepository,
 } from "../repos/index";
 import { LinkService } from "./link-service";
+import { createPayOptionsQuoter, type PayOptionsPort } from "./pay-options";
 import { AnchorHealth, AnchorHealthRegistry } from "./anchor-health";
 import {
   WatcherLoop,
@@ -126,6 +128,9 @@ export interface Container {
   /** Refunds against a link's payments (issue 4.58). */
   refunds: RefundRepository;
   config: { network: string; horizonUrl: string; sellerWallet: string | null; kycStatusCacheMs?: number };
+  /** Pay-with quotes for the checkout (issue 4.64). Undefined when
+   *  PATH_PAYMENTS_ENABLED is off, which the route reads as "link asset only". */
+  payOptions?: PayOptionsPort;
   horizonStatus(): HorizonStatus;
   /** Optional SSRF guard override for webhook URLs. Tests inject a permissive
    *  one so route tests do not depend on live DNS. */
@@ -177,6 +182,21 @@ export async function createContainer(): Promise<Container> {
     horizonUrl: env.horizonUrl,
     usdcIssuer: env.usdcIssuer,
   });
+
+  // Pay-with quotes (issue 4.64). Built ONLY when the flag is on: the route
+  // treats a missing port as "the link asset only", so a deployment with
+  // PATH_PAYMENTS_ENABLED unset never asks Horizon for a path.
+  const payOptions: PayOptionsPort | undefined = env.pathPaymentsEnabled
+    ? createPayOptionsQuoter({
+        client: realHorizonClient(stellar.horizonUrl),
+        maxSlippageBps: env.pathPaymentsMaxSlippageBps,
+        onError: (err, linkId) =>
+          logger.warn(
+            { event: "pay_options.quote_failed", linkId, err },
+            "path quote failed; offering the link asset only",
+          ),
+      })
+    : undefined;
 
   const { db, client } = createDb(env.databaseUrl, env.databaseAuthToken);
   // A real anchor's home domain attributes pre-4.24 seller_kyc rows to it; with
@@ -450,6 +470,7 @@ export async function createContainer(): Promise<Container> {
       : null,
     telemetry: telemetryRepo,
     refunds: refundsRepo,
+    payOptions,
     config: { network: stellar.network, horizonUrl: stellar.horizonUrl, sellerWallet, kycStatusCacheMs: env.kycStatusCacheMs },
     horizonStatus: () => pollingWatcher.getStatus(),
     metricsToken,

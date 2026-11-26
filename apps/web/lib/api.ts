@@ -14,7 +14,49 @@ export interface LinkWithRequest {
   link: PaymentLink;
   request: PaymentRequest;
   /** Paying in any asset (issue 8.30). Optional so older API responses still parse. */
-  pay?: { pathPayments: boolean; maxSlippageBps: number };
+  pay?: {
+    pathPayments: boolean;
+    maxSlippageBps: number;
+    /** Cap the wallet builder enforces on its build-time re-quote (issue 5.48). */
+    maxPriceImpactBps?: number;
+  };
+}
+
+/**
+ * One asset the buyer could pay with INSTEAD of the link asset, priced for
+ * their own account (issue 4.64, consumed by 5.47).
+ *
+ * Served by `GET /links/:id/pay-options` (issue 4.64,
+ * apps/api/src/routes/links.ts); the quote itself comes from Horizon's
+ * strict-receive paths for the buyer's own account.
+ *
+ * Both amounts are the quote's own figures: `sourceAmount` is the "about"
+ * number the buyer should expect to send and `maxSourceAmount` is the
+ * slippage-capped "at most" they can be charged. Neither is recomputed in the
+ * UI — a client-side estimate would be a number nobody quoted.
+ */
+export interface PayOption {
+  /** The asset the buyer would send. `issuer` is null for XLM. */
+  asset: { code: string; issuer: string | null };
+  /** Estimated amount of `asset` the buyer sends. */
+  sourceAmount: string;
+  /** Slippage-capped maximum amount of `asset` the buyer sends. */
+  maxSourceAmount: string;
+  /**
+   * Server epoch ms after which this quote is stale (compare with
+   * `serverNow()`, never `Date.now()`). Absent ⇒ no countdown, never a guess.
+   */
+  expiresAt?: number;
+}
+
+/**
+ * Body of `GET /links/:id/pay-options` (issue 4.64). `expiresAt` here is shared
+ * by every option and is copied onto options that don't carry their own.
+ */
+export interface PayOptionsResponse {
+  options?: PayOption[];
+  /** Quote expiry shared by every option, when the API sends one. */
+  expiresAt?: number;
 }
 
 /** One SEP-6 withdrawal type and the payout fields it needs (issue 5.24). */
@@ -596,6 +638,29 @@ export const api = {
   getReceipt: (reference: string) => http<PublicReceipt>(`/r/${reference}`),
 
   getPublicInvoice: (id: string) => http<PublicInvoice>(`/invoices/${id}/public`),
+
+  /**
+   * Other assets this buyer could pay the link with, quoted for `account`
+   * (issue 4.64). Only called when the link says `pay.pathPayments` (5.47).
+   * An empty array means "the link asset only" — never an error state.
+   *
+   * Wire contract (issue 4.64 — see `PayOption`):
+   *   GET /links/:id/pay-options?account=<G...>
+   *   200 { options: PayOption[], expiresAt?: number }
+   *   400 invalid_query for a missing/malformed account, 404 for an unknown link
+   * The account is the connected wallet, because the quote is per-buyer; the
+   * link's own `pay.pathPayments` flag stays the gate for calling this at all.
+   */
+  getPayOptions: async (id: string, account: string): Promise<PayOption[]> => {
+    const res = await http<PayOptionsResponse>(
+      `/links/${id}/pay-options?account=${encodeURIComponent(account)}`,
+    );
+    const shared = typeof res?.expiresAt === "number" ? res.expiresAt : undefined;
+    return (res?.options ?? []).map((option) => ({
+      ...option,
+      expiresAt: option.expiresAt ?? shared,
+    }));
+  },
 
   /** Indicative SEP-38 prices for a paid link — no firm quote is consumed. */
   getOfframpPreview: (id: string, currency?: string) =>

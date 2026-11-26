@@ -594,16 +594,33 @@ export class LinkService {
       );
     }
     const op = tx.operations[0]!;
-    if (op.type !== "payment") {
-      throw new HttpError(400, `Transaction must be a single payment operation, got "${op.type}"`);
+    // Issue 5.48: a strict-receive path payment delivers the same thing as a
+    // plain payment — the link asset to the link destination — with the buyer's
+    // own asset converted on the way. Both are validated on their *delivered*
+    // side, which is what the watcher settles on, so the checks below are shared.
+    const isPathPayment = op.type === "pathPaymentStrictReceive";
+    if (op.type !== "payment" && !isPathPayment) {
+      throw new HttpError(
+        400,
+        `Transaction must be a single payment or path payment operation, got "${op.type}"`,
+      );
     }
-    const payment = op as Operation.Payment;
+    const payment = op as Operation.Payment | Operation.PathPaymentStrictReceive;
 
     // A per-operation source lets the envelope move value out of an account
     // other than the signer's. Nothing about this flow needs it.
     if (payment.source && payment.source !== tx.source) {
       throw new HttpError(400, "Payment operation must not override the transaction source account");
     }
+
+    // Delivered side of the operation: `asset`/`amount` for a payment,
+    // `destAsset`/`destAmount` for a path payment.
+    const deliveredAsset = isPathPayment
+      ? (payment as Operation.PathPaymentStrictReceive).destAsset
+      : (payment as Operation.Payment).asset;
+    const deliveredAmount = isPathPayment
+      ? (payment as Operation.PathPaymentStrictReceive).destAmount
+      : (payment as Operation.Payment).amount;
 
     // ---- destination, asset, amount, memo ---------------------------------
     const expectedDestination = this.deps.rail.buildRequest({
@@ -620,9 +637,9 @@ export class LinkService {
     // `getIssuer()` is typed as possibly-undefined even on a non-native asset;
     // normalise to null so `assetEquals` compares like with like rather than
     // silently treating an issued asset as native.
-    const txAsset: AssetRef = payment.asset.isNative()
+    const txAsset: AssetRef = deliveredAsset.isNative()
       ? { code: "XLM", issuer: null }
-      : { code: payment.asset.getCode(), issuer: payment.asset.getIssuer() ?? null };
+      : { code: deliveredAsset.getCode(), issuer: deliveredAsset.getIssuer() ?? null };
     if (!assetEquals(txAsset, link.asset)) {
       throw new HttpError(
         409,
@@ -636,10 +653,10 @@ export class LinkService {
     // path unable to complete split payments.
     const outstandingStroops = toStroops(link.amount) - (link.paidAmount ? toStroops(link.paidAmount) : 0n);
     const outstanding = fromStroops(outstandingStroops > 0n ? outstandingStroops : 0n);
-    if (compareAmount(payment.amount, outstanding) === "under") {
+    if (compareAmount(deliveredAmount, outstanding) === "under") {
       throw new HttpError(
         409,
-        `Amount too low: link expects ${outstanding}, transaction sends ${payment.amount}`,
+        `Amount too low: link expects ${outstanding}, transaction sends ${deliveredAmount}`,
       );
     }
 

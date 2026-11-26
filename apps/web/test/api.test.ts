@@ -67,6 +67,77 @@ describe("api.exportCsv", () => {
   });
 });
 
+describe("api.getPayOptions (issue 4.64)", () => {
+  const realFetch = globalThis.fetch;
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.restoreAllMocks();
+  });
+
+  function stubJson(body: unknown): ReturnType<typeof vi.fn> {
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    return fetchMock;
+  }
+
+  it("asks for the buyer's account and applies the shared expiry to every option", async () => {
+    const fetchMock = stubJson({
+      options: [
+        { asset: { code: "XLM", issuer: null }, sourceAmount: "24.12", maxSourceAmount: "24.3612" },
+      ],
+      expiresAt: 1_800_000_090_000,
+    });
+
+    const options = await api.getPayOptions("lnk_1", "GBUYER");
+
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`${apiBase()}/links/lnk_1/pay-options?account=GBUYER`);
+    // One request returns every option; the server quotes them in one Horizon call.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(options).toEqual([
+      {
+        asset: { code: "XLM", issuer: null },
+        sourceAmount: "24.12",
+        maxSourceAmount: "24.3612",
+        expiresAt: 1_800_000_090_000,
+      },
+    ]);
+  });
+
+  it("URL-encodes the account", async () => {
+    const fetchMock = stubJson({ options: [] });
+
+    await api.getPayOptions("lnk_1", "G B/1");
+
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe(`${apiBase()}/links/lnk_1/pay-options?account=G%20B%2F1`);
+  });
+
+  it("returns an empty list when the API offers only the link asset", async () => {
+    stubJson({ options: [] });
+
+    await expect(api.getPayOptions("lnk_1", "GBUYER")).resolves.toEqual([]);
+  });
+
+  it("surfaces a 404 as a CheckoutError", async () => {
+    globalThis.fetch = vi.fn(
+      async () => new Response('{"error":"not_found"}', { status: 404 }),
+    ) as unknown as typeof fetch;
+
+    await expect(api.getPayOptions("lnk_missing", "GBUYER")).rejects.toMatchObject({
+      code: "not_found",
+      status: 404,
+    });
+  });
+});
+
 /**
  * Issue #35: the checkout countdown is measured against the server's clock,
  * learned from the `Date` header, because a buyer's device can be minutes out

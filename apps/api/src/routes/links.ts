@@ -1,4 +1,5 @@
 import { Hono, type MiddlewareHandler } from "hono";
+import { StrKey } from "@stellar/stellar-sdk";
 import {
   createLinkSchema,
   cashOutSchema,
@@ -133,9 +134,37 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
       link: toCheckoutView(result.link),
       request: result.request,
       // The checkout reads the path-payment switch from here, never from its
-      // own env (issue 8.30).
-      pay: { pathPayments: env.pathPaymentsEnabled, maxSlippageBps: env.pathPaymentsMaxSlippageBps },
+      // own env (issue 8.30). `maxPriceImpactBps` is the cap the wallet builder
+      // enforces on its build-time re-quote (issue 5.48).
+      pay: {
+        pathPayments: env.pathPaymentsEnabled,
+        maxSlippageBps: env.pathPaymentsMaxSlippageBps,
+        maxPriceImpactBps: env.pathPaymentsMaxPriceImpactBps,
+      },
     });
+  });
+
+  // The assets this buyer could pay with INSTEAD of the link asset, quoted for
+  // their own wallet (issue 4.64). Public like the other buyer-facing reads —
+  // the payer holds no seller session — and strictly rate-limited because every
+  // call asks Horizon for a path quote.
+  //
+  // Gated by construction: `c.payOptions` is wired only when
+  // PATH_PAYMENTS_ENABLED=true (services/container.ts), so with the flag off
+  // this answers "link asset only" without touching Horizon.
+  //
+  // An empty list is never an error: the checkout keeps today's one-asset
+  // payment. That covers a link that is not payable, an empty order book, and
+  // Horizon being unreachable.
+  app.get("/:id/pay-options", strictRateLimit, async (ctx) => {
+    const account = ctx.req.query("account");
+    if (!account || !StrKey.isValidEd25519PublicKey(account)) {
+      return ctx.json({ error: "invalid_query", message: "account must be a Stellar G... address" }, 400);
+    }
+    const result = await c.service.getLink(ctx.req.param("id"));
+    if (!result) return ctx.json({ error: "not_found" }, 404);
+    if (!c.payOptions) return ctx.json({ options: [] });
+    return ctx.json(await c.payOptions({ link: result.link, account }));
   });
 
   // Indicative off-ramp prices — SEP-38 GET /prices, no firm quote consumed.

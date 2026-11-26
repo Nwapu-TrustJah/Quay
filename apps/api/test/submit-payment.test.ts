@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   Account,
   Asset,
@@ -31,6 +31,21 @@ import {
 //
 //  None of these reach the network — each assertion fires before submission.
 // ---------------------------------------------------------------------------
+
+// Submission is the one step that would need a live Horizon, so the server is
+// swapped for a recorder. Everything else stays the real SDK: the envelopes
+// these tests build and validate are genuine XDR (issue 5.48).
+const horizonState = vi.hoisted(() => ({ submit: vi.fn() }));
+
+vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
+  class Server {
+    submitTransaction() {
+      return horizonState.submit();
+    }
+  }
+  return { ...actual, Horizon: { ...actual.Horizon, Server } };
+});
 
 const DEST = Keypair.random().publicKey();
 const BUYER = Keypair.random();
@@ -143,7 +158,7 @@ describe("submitPayment — envelope validation", () => {
 
   it("rejects a non-payment operation", async () => {
     const xdr = build([Operation.changeTrust({ asset: USDC })]);
-    await expectRejected(xdr, 400, /single payment operation, got "changeTrust"/);
+    await expectRejected(xdr, 400, /single payment or path payment operation, got "changeTrust"/);
   });
 
   it("rejects an operation-level source override", async () => {
@@ -210,5 +225,100 @@ describe("submitPayment — envelope validation", () => {
   it("409s a link that is no longer open", async () => {
     await links.save(makeLink({ id: "lnk_1", reference: "pl_ref1", status: "paid", destination: DEST }));
     await expect(service.submitPayment("lnk_1", build())).rejects.toThrow(/cannot accept payment/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+//  Path payments (issue 5.48).
+//
+//  The buyer who chose another asset signs a `pathPaymentStrictReceive`: the
+//  destination receives the link asset, the payer spends theirs. Validation is
+//  on the delivered side — the same side the watcher settles on — so these
+//  assertions are about what is actually delivered, not what is spent.
+// ---------------------------------------------------------------------------
+
+describe("submitPayment — path payments (issue 5.48)", () => {
+  const XLM = Asset.native();
+
+  /** The path payment the checkout builds for a buyer paying 10 USDC in XLM. */
+  function pathPayment(
+    over: Partial<Parameters<typeof Operation.pathPaymentStrictReceive>[0]> = {},
+  ) {
+    return Operation.pathPaymentStrictReceive({
+      sendAsset: XLM,
+      sendMax: "24.36",
+      destination: DEST,
+      destAsset: USDC,
+      destAmount: "10",
+      path: [],
+      ...over,
+    });
+  }
+
+  beforeEach(() => {
+    horizonState.submit.mockReset();
+    horizonState.submit.mockResolvedValue({ hash: "path_tx_hash" });
+  });
+
+  it("accepts a strict-receive path payment that delivers the link asset", async () => {
+    const result = await service.submitPayment("lnk_1", build([pathPayment()]));
+
+    expect(result).toEqual({ txHash: "path_tx_hash" });
+    expect(horizonState.submit).toHaveBeenCalledTimes(1);
+  });
+
+  it("accepts an overpayment on the delivered side", async () => {
+    await expect(
+      service.submitPayment("lnk_1", build([pathPayment({ destAmount: "12" })])),
+    ).resolves.toEqual({ txHash: "path_tx_hash" });
+  });
+
+  it("rejects a path payment that delivers a different asset", async () => {
+    const xlmLink = new Asset("XLM", ISSUER); // a different asset with an issuer
+    await expectRejected(
+      build([pathPayment({ destAsset: xlmLink })]),
+      409,
+      /Asset mismatch/,
+    );
+    expect(horizonState.submit).not.toHaveBeenCalled();
+  });
+
+  it("rejects a path payment that delivers too little", async () => {
+    await expectRejected(build([pathPayment({ destAmount: "9.5" })]), 409, /Amount too low/);
+  });
+
+  it("rejects a path payment addressed elsewhere", async () => {
+    await expectRejected(
+      build([pathPayment({ destination: ATTACKER.publicKey() })]),
+      409,
+      /destination does not match/,
+    );
+  });
+
+  it("rejects a path payment that drops the memo", async () => {
+    await expectRejected(build([pathPayment()], Memo.none()), 409, /memo does not match/i);
+  });
+
+  it("rejects an operation-level source override on a path payment", async () => {
+    await expectRejected(
+      build([pathPayment({ source: ATTACKER.publicKey() })]),
+      400,
+      /must not override the transaction source/,
+    );
+  });
+
+  // `pathPaymentStrictSend` fixes what the buyer spends instead, so the amount
+  // that arrives is whatever the book gives — not a figure we can promise the
+  // seller. The checkout never builds one; a hand-made one is refused.
+  it("rejects a strict-send path payment", async () => {
+    const strictSend = Operation.pathPaymentStrictSend({
+      sendAsset: XLM,
+      sendAmount: "24",
+      destination: DEST,
+      destAsset: USDC,
+      destMin: "10",
+      path: [],
+    });
+    await expectRejected(build([strictSend]), 400, /single payment or path payment operation/);
   });
 });
