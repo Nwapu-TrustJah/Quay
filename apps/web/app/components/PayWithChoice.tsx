@@ -15,7 +15,10 @@ export function sameAsset(
 /** "about 24.12 XLM, at most 24.36 XLM" — the quote's own figures (issue 5.47). */
 export function formatPayOption(option: PayOption): string {
   const code = option.asset.code;
-  return `about ${option.sourceAmount} ${code}, at most ${option.maxSourceAmount} ${code}`;
+  // Amount and code are glued with a no-break space: on a 375px screen the
+  // option wraps, and a plain space leaves the asset code alone on line two
+  // ("…at most 24.36" / "XLM"). Wrapping before the amount reads as a pair.
+  return `about ${option.sourceAmount}\u00A0${code}, at most ${option.maxSourceAmount}\u00A0${code}`;
 }
 
 /**
@@ -147,7 +150,9 @@ export default function PayWithChoice({
         {announcement ?? ""}
       </p>
 
-      <p className="pay-choice__hint">The QR code above always pays in {linkAssetCode}.</p>
+      {/* Deliberately does not say "above": this panel also renders on the
+          underpaid screen, which has no QR code. */}
+      <p className="pay-choice__hint">QR payments always use {linkAssetCode}.</p>
     </fieldset>
   );
 }

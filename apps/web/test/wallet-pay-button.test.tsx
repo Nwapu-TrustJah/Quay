@@ -302,14 +302,16 @@ describe("WalletPayButton", () => {
 
       const group = choiceGroup() as HTMLElement;
       expect(group.querySelector("legend")?.textContent).toBe("Pay with");
+      // The amount and its asset code are joined by a no-break space so a
+      // narrow screen never wraps the code onto a line of its own.
       expect(radios().map((radio) => radio.closest("label")!.textContent)).toEqual([
         "10 USDC",
-        "about 24.12 XLM, at most 24.36 XLM",
+        "about 24.12\u00A0XLM, at most 24.36\u00A0XLM",
       ]);
       // One radio group: the shared name is what gives arrow-key navigation.
       expect(radios().map((radio) => radio.name)).toEqual(["payAsset", "payAsset"]);
       expect(radios()[0]!.checked).toBe(true);
-      expect(group.textContent).toContain("The QR code above always pays in USDC.");
+      expect(group.textContent).toContain("QR payments always use USDC.");
       expect(liveRegion()).toBeTruthy();
       // Nothing is built or signed until the buyer confirms the choice.
       expect(build).not.toHaveBeenCalled();
@@ -389,7 +391,7 @@ describe("WalletPayButton", () => {
       await act(async () => {});
 
       expect(apiMock.getPayOptions).toHaveBeenCalledTimes(2);
-      expect(container.textContent).toContain("about 24.20 XLM, at most 24.44 XLM");
+      expect(container.textContent).toContain("about 24.20\u00A0XLM, at most 24.44\u00A0XLM");
       expect(radios()[1]!.checked).toBe(true);
       expect(container.textContent).not.toContain("Quote expired");
     });
