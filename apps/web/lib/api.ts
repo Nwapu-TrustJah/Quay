@@ -14,7 +14,12 @@ export interface LinkWithRequest {
   link: PaymentLink;
   request: PaymentRequest;
   /** Paying in any asset (issue 8.30). Optional so older API responses still parse. */
-  pay?: { pathPayments: boolean; maxSlippageBps: number };
+  pay?: {
+    pathPayments: boolean;
+    maxSlippageBps: number;
+    /** Cap the wallet builder enforces on its build-time re-quote (issue 5.48). */
+    maxPriceImpactBps?: number;
+  };
 }
 
 /**

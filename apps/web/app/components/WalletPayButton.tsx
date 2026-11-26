@@ -3,7 +3,14 @@
 import { useCallback, useState } from "react";
 import { fromStroops, toStroops } from "@checkout/core";
 import { api, CheckoutError, type LinkWithRequest, type PayOption } from "../../lib/api";
-import { checkPaymentPreflight } from "../../lib/payment-preflight";
+import { checkPaymentPreflight, type PaymentPreflightFail } from "../../lib/payment-preflight";
+import {
+  buildDirectPaymentXdr,
+  buildPathPaymentXdr,
+  PathPaymentError,
+  planPathPayment,
+  type PaymentHorizon,
+} from "../../lib/payment-build";
 import {
   connectWallet,
   getWalletNetwork,
@@ -26,8 +33,6 @@ type WalletPaymentErrorCode =
   | "price_moved"
   | "no_path"
   | "wrong_network"
-  /** Chosen a foreign asset, but 5.48 has not built that transaction yet. */
-  | "path_payment_unavailable"
   | "unavailable";
 
 class WalletPaymentError extends Error {
@@ -38,11 +43,11 @@ class WalletPaymentError extends Error {
 }
 
 /**
- * Everything the transaction builder needs (issue 5.47).
+ * Everything the transaction builder needs (issues 5.47, 5.48).
  *
- * `payOption` is the buyer's choice: null means "the link asset", and a
- * non-null option is the asset — with its quote — that issue 5.48 turns into a
- * path-payment operation. 5.47 only chooses; building the path payment is 5.48.
+ * `payOption` is the buyer's choice: null means "the link asset" (a plain
+ * payment), and a non-null option is the asset — with the cap they accepted —
+ * that becomes a `pathPaymentStrictReceive` built from a fresh quote.
  */
 export interface PaymentBuildContext {
   address: string;
@@ -198,7 +203,7 @@ export default function WalletPayButton({ initial, disabled = false, onSubmitted
       </button>
       {error && (
         <p className="err" role="alert">
-          {walletErrorCopy(error, initial.request.asset.code, choice?.selected?.asset.code)}
+          {walletErrorCopy(error, initial.request.asset.code)}
         </p>
       )}
     </div>
@@ -213,24 +218,28 @@ function outstandingAmount(initial: LinkWithRequest): string {
   return outstanding > 0n ? fromStroops(outstanding) : "0";
 }
 
-export async function buildPaymentXdr({ address, initial, payOption }: PaymentBuildContext): Promise<string> {
-  // Issue 5.48 constructs the path payment for a chosen foreign asset. Until it
-  // lands this builder can only pay the link asset, so it refuses a choice it
-  // cannot honour rather than silently charging a different asset than the one
-  // the buyer picked. The distinct code lets the UI name both assets instead of
-  // showing the generic "could not be prepared" copy.
-  if (payOption) {
-    throw new WalletPaymentError(
-      "path_payment_unavailable",
-      `Paying in ${payOption.asset.code} is not wired up yet.`,
-    );
-  }
+/**
+ * The deployment's default `PATH_PAYMENTS_MAX_PRICE_IMPACT_BPS`, used only when
+ * an older API response predates the field. The API serves the live value on
+ * `GET /links/:id` (issue 5.48), and that is what a current deployment enforces.
+ */
+export const DEFAULT_MAX_PRICE_IMPACT_BPS = 300;
 
+/** Horizon seam for the builder: tests inject one, production uses the real server. */
+export interface PaymentBuildDeps {
+  horizon?: PaymentHorizon;
+}
+
+export async function buildPaymentXdr(
+  { address, initial, payOption }: PaymentBuildContext,
+  deps: PaymentBuildDeps = {},
+): Promise<string> {
   const stellar = await import("@stellar/stellar-sdk");
-  const server = new stellar.Horizon.Server(HORIZON_URL);
-  let account: Awaited<ReturnType<typeof server.loadAccount>>;
+  const horizon =
+    deps.horizon ?? (new stellar.Horizon.Server(HORIZON_URL) as unknown as PaymentHorizon);
+  let account: Awaited<ReturnType<PaymentHorizon["loadAccount"]>>;
   try {
-    account = await server.loadAccount(address);
+    account = await horizon.loadAccount(address);
   } catch {
     throw new WalletPaymentError("insufficient_balance", "This wallet is not funded on the selected network.");
   }
@@ -244,40 +253,67 @@ export async function buildPaymentXdr({ address, initial, payOption }: PaymentBu
   }
   const paymentAmount = fromStroops(outstanding);
 
+  if (!account.sequence) {
+    throw new WalletPaymentError("unavailable", "The wallet account sequence could not be read.");
+  }
+
+  const tx = {
+    address,
+    sequence: account.sequence,
+    destination: initial.request.destination,
+    destAsset: expected,
+    destAmount: paymentAmount,
+    networkPassphrase: NETWORK_PASSPHRASE,
+    memo: initial.request.memo,
+    feeStroops: BASE_FEE_STROOPS,
+  };
+
+  if (payOption) {
+    // Issue 5.48: the panel's quote is advisory, so price the payment again for
+    // the outstanding amount and refuse a conversion the buyer did not accept.
+    let plan;
+    try {
+      plan = await planPathPayment({
+        client: horizon,
+        buyer: address,
+        destAsset: expected,
+        destAmount: paymentAmount,
+        option: payOption,
+        maxPriceImpactBps: initial.pay?.maxPriceImpactBps ?? DEFAULT_MAX_PRICE_IMPACT_BPS,
+      });
+    } catch (cause) {
+      if (cause instanceof PathPaymentError) {
+        throw new WalletPaymentError(cause.code, cause.message);
+      }
+      throw cause;
+    }
+
+    // The buyer spends the chosen asset, so that is what has to be funded —
+    // not the link asset, which the destination receives through the path.
+    const preflight = checkPaymentPreflight(account, plan.sourceAsset, plan.sourceAmount, {
+      feeStroops: BASE_FEE_STROOPS,
+    });
+    if (!preflight.ok) throw preflightError(preflight);
+
+    return buildPathPaymentXdr({ ...tx, plan });
+  }
+
   const preflight = checkPaymentPreflight(
     account,
     expected,
     outstanding,
     { feeStroops: BASE_FEE_STROOPS },
   );
+  if (!preflight.ok) throw preflightError(preflight);
 
-  if (!preflight.ok) {
-    if (preflight.reason === "missing_trustline") {
-      throw new WalletPaymentError("missing_trustline", `This wallet has no ${expected.code} trustline.`);
-    }
-    throw new WalletPaymentError("insufficient_balance", preflight.message);
+  return buildDirectPaymentXdr(tx);
+}
+
+function preflightError(preflight: PaymentPreflightFail): WalletPaymentError {
+  if (preflight.reason === "missing_trustline") {
+    return new WalletPaymentError("missing_trustline", `This wallet has no ${preflight.assetCode} trustline.`);
   }
-
-  if (!account.sequence) {
-    throw new WalletPaymentError("unavailable", "The wallet account sequence could not be read.");
-  }
-  const source = new stellar.Account(address, account.sequence);
-  const asset = expected.issuer === null
-    ? stellar.Asset.native()
-    : new stellar.Asset(expected.code, expected.issuer);
-  const builder = new stellar.TransactionBuilder(source, {
-    fee: String(BASE_FEE_STROOPS),
-    networkPassphrase: NETWORK_PASSPHRASE,
-  }).addOperation(
-    stellar.Operation.payment({
-      destination: initial.request.destination,
-      asset,
-      amount: paymentAmount,
-    }),
-  );
-
-  if (initial.request.memo) builder.addMemo(stellar.Memo.text(initial.request.memo));
-  return builder.setTimeout(300).build().toXDR();
+  return new WalletPaymentError("insufficient_balance", preflight.message);
 }
 
 function walletErrorMessage(cause: unknown): string {
@@ -306,7 +342,6 @@ function apiErrorCode(error: CheckoutError): WalletPaymentErrorCode {
 function walletErrorCopy(
   code: WalletPaymentErrorCode,
   linkAssetCode?: string,
-  selectedAssetCode?: string,
 ): string {
   switch (code) {
     case "user_rejected":
@@ -323,12 +358,6 @@ function walletErrorCopy(
         : "There is not enough market depth to pay this in the selected asset right now.";
     case "wrong_network":
       return "Your wallet is connected to the wrong Stellar network. Switch networks and try again.";
-    case "path_payment_unavailable":
-      // Honest interim copy until 5.48 lands: say plainly that this route isn't
-      // open yet and which choice still works, rather than a vague failure.
-      return selectedAssetCode && linkAssetCode
-        ? `Paying in ${selectedAssetCode} isn't available yet. Choose ${linkAssetCode} to pay now.`
-        : "Paying in the selected asset isn't available yet.";
     default:
       return "The payment could not be prepared. The QR code and wallet link are still available.";
   }

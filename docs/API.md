@@ -495,7 +495,17 @@ lnk_y70hu7frwy,pl_8q5g02fczihq,"Order #1042",10.5,USDC,offramp_settled,GAQODF5S.
 checkout page). The link id is the bearer capability; seller-only detail remains
 behind `GET /links/:id/detail`.
 
-**200** — same shape as the `POST /links` response.
+**200** — same shape as the `POST /links` response, plus a `pay` block the
+checkout reads instead of keeping its own copy of the flags:
+```json
+{ "pay": { "pathPayments": true, "maxSlippageBps": 100, "maxPriceImpactBps": 300 } }
+```
+- `pathPayments` — whether this deployment offers paying in another asset.
+- `maxSlippageBps` — the allowance already baked into each option's
+  `maxSourceAmount`.
+- `maxPriceImpactBps` — the cap the wallet builder applies to its build-time
+  re-quote (issue 5.48); `PATH_PAYMENTS_MAX_PRICE_IMPACT_BPS`, default 300.
+
 **404** — `{ "error": "not_found" }`
 
 ---
@@ -645,9 +655,15 @@ Fires the `link.cancelled` webhook.
 
 **Public — no auth.** The buyer submits a transaction signed by their own wallet.
 The API parses and validates the complete XDR before relaying it to Horizon. It
-accepts exactly one payment operation and verifies the destination, asset, amount,
-and required `MEMO_TEXT` against the link. It never marks the link paid directly;
-the ledger watcher remains the source of truth.
+accepts exactly one operation — a `payment`, or a `pathPaymentStrictReceive` when
+the buyer pays in another asset (issue 5.48) — and verifies the destination,
+the **delivered** asset and amount, and the required `MEMO_TEXT` against the
+link. For a path payment that means `destAsset`/`destAmount`: what the seller
+receives, which is also what the watcher settles on. `sendMax` and the source
+asset are the buyer's own money and are never compared to the link.
+`pathPaymentStrictSend` is refused — it fixes what is spent, not what arrives.
+It never marks the link paid directly; the ledger watcher remains the source of
+truth.
 
 **Request**
 ```json
@@ -660,7 +676,7 @@ the ledger watcher remains the source of truth.
 ```
 
 **400** — malformed XDR, fee-bump envelope, or a transaction containing anything
-other than exactly one payment operation.
+other than exactly one payment or strict-receive path payment operation.
 
 **409** — the link is unavailable, or the transaction does not match the link.
 A Horizon rejection returns `{ "error": "payment_rejected", "reason": "...", "detail": "..." }`,

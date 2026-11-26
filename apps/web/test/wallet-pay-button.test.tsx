@@ -9,7 +9,14 @@ const wallet = vi.hoisted(() => ({
   signTransaction: vi.fn(),
 }));
 const apiMock = vi.hoisted(() => ({ getLink: vi.fn(), submitPayment: vi.fn(), getPayOptions: vi.fn() }));
-const sdk = vi.hoisted(() => ({ loadAccount: vi.fn(), memos: [] as string[] }));
+const sdk = vi.hoisted(() => ({
+  loadAccount: vi.fn(),
+  memos: [] as string[],
+  /** Strict-receive records the fake Horizon answers with (issue 5.48). */
+  paths: [] as Array<Record<string, unknown>>,
+  paymentOps: [] as Array<Record<string, unknown>>,
+  pathOps: [] as Array<Record<string, unknown>>,
+}));
 
 vi.mock("../lib/wallet", () => ({
   NETWORK_PASSPHRASE: "Test SDF Network ; September 2015",
@@ -24,7 +31,10 @@ vi.mock("../lib/api", async (importOriginal) => {
 });
 
 // Only the late path (after the link is confirmed payable) reaches the SDK.
-vi.mock("@stellar/stellar-sdk", () => {
+// Partial mock: `@checkout/stellar` (the build-time quote, 5.48) is imported
+// through the same module and needs the real `Networks` and friends.
+vi.mock("@stellar/stellar-sdk", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@stellar/stellar-sdk")>();
   class Builder {
     addOperation() {
       return this;
@@ -41,11 +51,27 @@ vi.mock("@stellar/stellar-sdk", () => {
     }
   }
   return {
-    Horizon: { Server: class { loadAccount = sdk.loadAccount; } },
+    ...actual,
+    Horizon: {
+      ...actual.Horizon,
+      Server: class {
+        loadAccount = sdk.loadAccount;
+        strictReceivePaths = () => ({ call: async () => ({ records: sdk.paths }) });
+      },
+    },
     Account: class {},
-    Asset: Object.assign(class {}, { native: () => ({}) }),
+    Asset: Object.assign(class {}, { native: () => ({ native: true }) }),
     Memo: { text: (m: string) => m },
-    Operation: { payment: (o: unknown) => o },
+    Operation: {
+      payment: (o: Record<string, unknown>) => {
+        sdk.paymentOps.push(o);
+        return o;
+      },
+      pathPaymentStrictReceive: (o: Record<string, unknown>) => {
+        sdk.pathOps.push(o);
+        return o;
+      },
+    },
     TransactionBuilder: Builder,
   };
 });
@@ -81,7 +107,7 @@ const XLM_OPTION: PayOption = {
 
 /** The same link, but with the pay-in-any-asset flag on. */
 function pathLink(over: Partial<LinkWithRequest["link"]> = {}): LinkWithRequest {
-  return { ...link(over), pay: { pathPayments: true, maxSlippageBps: 100 } };
+  return { ...link(over), pay: { pathPayments: true, maxSlippageBps: 100, maxPriceImpactBps: 300 } };
 }
 
 const fundedAccount = {
@@ -116,6 +142,9 @@ describe("WalletPayButton", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     sdk.memos.length = 0;
+    sdk.paths.length = 0;
+    sdk.paymentOps.length = 0;
+    sdk.pathOps.length = 0;
     wallet.connectWallet.mockResolvedValue("GBUYER");
     wallet.getWalletNetwork.mockResolvedValue({ network: "TESTNET", networkPassphrase: PASSPHRASE });
     wallet.signTransaction.mockResolvedValue("SIGNED_XDR");
@@ -332,17 +361,41 @@ describe("WalletPayButton", () => {
       expect(onSubmitted).toHaveBeenCalledWith("tx_abc");
     });
 
-    it("refuses a chosen foreign asset instead of quietly charging the link asset", async () => {
-      // 5.48 owns the path payment. Until it lands the default builder must not
-      // fall back to the link asset: the buyer picked XLM and must be told so.
+    it("builds and submits the chosen asset as a path payment (issue 5.48)", async () => {
       apiMock.getPayOptions.mockResolvedValue([XLM_OPTION]);
+      // Horizon quotes the same XLM path for the full amount and the 1% slice.
+      sdk.paths.push({ source_asset_type: "native", source_amount: "24.12", path: [] });
       await mount(pathLink());
       await pay();
       await act(async () => radios()[1]!.click());
       await pay();
 
-      expect(alertText()).toContain("Paying in XLM isn't available yet");
-      expect(alertText()).toContain("Choose USDC to pay now");
+      // One strict-receive path payment, never a plain payment in the link asset.
+      expect(sdk.paymentOps).toHaveLength(0);
+      expect(sdk.pathOps).toHaveLength(1);
+      expect(sdk.pathOps[0]).toMatchObject({
+        destination: "GSELLER",
+        destAmount: "10",
+        // The cap the buyer accepted, not the fresh quote.
+        sendMax: "24.36",
+        path: [],
+      });
+      expect(wallet.signTransaction).toHaveBeenCalledWith("UNSIGNED_XDR", "GBUYER");
+      expect(apiMock.submitPayment).toHaveBeenCalledWith("lnk_1", "SIGNED_XDR");
+      expect(onSubmitted).toHaveBeenCalledWith("tx_abc");
+    });
+
+    it("keeps the buyer's choice when there is no path left at build time", async () => {
+      apiMock.getPayOptions.mockResolvedValue([XLM_OPTION]);
+      // The panel quoted XLM, but the book is gone by the time they press pay.
+      sdk.paths.length = 0;
+      await mount(pathLink());
+      await pay();
+      await act(async () => radios()[1]!.click());
+      await pay();
+
+      expect(alertText()).toContain("not enough market depth");
+      expect(alertText()).toContain("Pay in USDC instead");
       expect(wallet.signTransaction).not.toHaveBeenCalled();
       expect(apiMock.submitPayment).not.toHaveBeenCalled();
       // The choice is still on screen and still selected.
