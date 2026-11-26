@@ -433,6 +433,61 @@ route — the pay half still runs live. For a manual run with accounts you
 already funded, pass `REFUND_PROBE_BUYER_SECRET` and
 `REFUND_PROBE_SELLER_SECRET` instead of the funder secret.
 
+### Nightly path-payment probe
+
+`.github/workflows/path-payment-probe.yml` runs
+`apps/api/test/live/path-payment.live.test.ts` nightly at 05:00 UTC (issue
+5.51). It creates a 10 USDC link for a throwaway seller, asks
+`GET /links/:id/pay-options` what that buyer could pay with instead, gets
+priced in XLM, then builds a real `pathPaymentStrictReceive` with the
+checkout's own builder (`apps/web/lib/payment-build.ts`, 5.48), signs it with
+the buyer's key in the test process, submits it through
+`POST /links/:id/submit`, and waits for the probe's own `WatcherLoop` to mark
+the link `paid` from the ledger. It finishes on the receipt and the seller's
+CSV export: both must say the buyer spent XLM on a USDC link. It is the live
+evidence behind `PATH_PAYMENTS_ENABLED`.
+
+**Why a USDC link paid in XLM.** The link asset has to be something the seller
+can hold and the buyer must be able to afford without a faucet. USDC is
+Circle's testnet issuer (`USDC_ISSUER_TESTNET`, the API's default) and XLM is
+what Friendbot hands out, and testnet already has an XLM ↔ USDC order book, so
+the probe fabricates no liquidity of its own. The seller gets Friendbot XLM and
+a USDC trustline the probe adds; the buyer only needs XLM.
+
+**No secrets to configure.** Both wallets are random per run and Friendbot
+funds them, so what the probe spends is testnet XLM, nothing that needs
+refilling. To reuse dedicated keys instead, set the repository Actions secrets
+`TEST_PATH_PAYMENT_BUYER_SECRET` / `TEST_PATH_PAYMENT_SELLER_SECRET`; they are
+optional. Never put a secret seed in a tracked file.
+
+**The flag is required.** `GET /links/:id/pay-options` reads
+`PATH_PAYMENTS_ENABLED` from the process environment, so the probe is run with
+`PATH_PAYMENTS_ENABLED=true`; the boot stage fails with an explicit message if
+it is off rather than passing vacuously.
+
+**Reading a failure.** Tests are named `stage N/6 <stage>` and later stages are
+skipped once one fails, so the first red test is where the flow broke:
+`prepare` (Friendbot or trustline), `boot` (API boot, link creation, the flag),
+`options` (the quote — usually no XLM ↔ USDC path on testnet), `build` (the
+re-quote, the price-impact cap, or the accepted `maxSourceAmount`),
+`pay` (submission, the watcher's `paid` transition, or the ledger operation),
+`receipt` (receipt `paidWith` or the CSV's `paid_with` column). The job summary
+also lists the quoted amount, `sendMax`, what was actually spent, the measured
+price impact and the two Horizon timings.
+
+**Run it locally:**
+
+```bash
+RUN_LIVE_PATH_TESTS=1 PATH_PAYMENTS_ENABLED=true \
+  pnpm --filter @checkout/api exec vitest run test/live/path-payment.live.test.ts --reporter=verbose
+```
+
+It is skipped, never failed, without `RUN_LIVE_PATH_TESTS`. The probe takes no
+credentials; if you pass `PATH_PAYMENT_PROBE_BUYER_SECRET`, that account is
+reused instead of a fresh one and must already hold XLM. Baseline latency on
+testnet is about 0.3–0.5 s per Horizon strict-receive call, so the build-time
+re-quote (full amount + 1% slice) adds roughly 0.3–1 s to a path payment.
+
 ## Deploy
 
 Render deploys `apps/api` as a single Docker web service. The starter plan is
