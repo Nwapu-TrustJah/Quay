@@ -300,6 +300,8 @@ describe("WalletPayButton", () => {
       await mount(pathLink(), { buildTransaction: build });
       await pay();
 
+      // One request quotes every asset (issue 4.64): not one call per option.
+      expect(apiMock.getPayOptions).toHaveBeenCalledTimes(1);
       const group = choiceGroup() as HTMLElement;
       expect(group.querySelector("legend")?.textContent).toBe("Pay with");
       // The amount and its asset code are joined by a no-break space so a

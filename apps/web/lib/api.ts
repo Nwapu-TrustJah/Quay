@@ -21,12 +21,9 @@ export interface LinkWithRequest {
  * One asset the buyer could pay with INSTEAD of the link asset, priced for
  * their own account (issue 4.64, consumed by 5.47).
  *
- * CONTRACT STATUS: issue 4.64's `GET /links/:id/pay-options` is not implemented
- * anywhere in this repo yet (no route, schema, doc or history entry defines it).
- * The shape below is therefore the ASSUMED contract that 5.47 and 5.48 are
- * written against; when 4.64 lands, this block and `api.getPayOptions` are the
- * only places that need reconciling. Until then these field names are ours, not
- * the server's.
+ * Served by `GET /links/:id/pay-options` (issue 4.64,
+ * apps/api/src/routes/links.ts); the quote itself comes from Horizon's
+ * strict-receive paths for the buyer's own account.
  *
  * Both amounts are the quote's own figures: `sourceAmount` is the "about"
  * number the buyer should expect to send and `maxSourceAmount` is the
@@ -48,9 +45,8 @@ export interface PayOption {
 }
 
 /**
- * Body of `GET /links/:id/pay-options` (issue 4.64) — assumed, not yet served
- * by any route in this repo. `expiresAt` here is shared by every option and is
- * copied onto options that don't carry their own.
+ * Body of `GET /links/:id/pay-options` (issue 4.64). `expiresAt` here is shared
+ * by every option and is copied onto options that don't carry their own.
  */
 export interface PayOptionsResponse {
   options?: PayOption[];
@@ -643,9 +639,10 @@ export const api = {
    * (issue 4.64). Only called when the link says `pay.pathPayments` (5.47).
    * An empty array means "the link asset only" — never an error state.
    *
-   * Assumed wire contract (4.64 not implemented yet — see `PayOption`):
+   * Wire contract (issue 4.64 — see `PayOption`):
    *   GET /links/:id/pay-options?account=<G...>
    *   200 { options: PayOption[], expiresAt?: number }
+   *   400 invalid_query for a missing/malformed account, 404 for an unknown link
    * The account is the connected wallet, because the quote is per-buyer; the
    * link's own `pay.pathPayments` flag stays the gate for calling this at all.
    */

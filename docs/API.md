@@ -6,8 +6,8 @@ The API is served by `@checkout/api` (Hono) on `http://localhost:8787` by defaul
 > **Auth:** `POST /auth` issues a session JWT after a wallet-signed SEP-10
 > challenge; a seller row is created for the wallet on first login. **`/links`
 > and `/webhooks` require it**, except the public checkout reads
-> (`GET /links/:id`, `POST /links/:id/submit`) and `GET /r/:reference`: every
-> other route under those prefixes needs
+> (`GET /links/:id`, `GET /links/:id/pay-options`, `POST /links/:id/submit`) and
+> `GET /r/:reference`: every other route under those prefixes needs
 > `Authorization: Bearer <token>` (or the httpOnly `session` cookie set by
 > `POST /auth`) and returns `401` without one. The web UI provides wallet login via
 > `SessionGate` (`apps/web/app/components/SessionGate.tsx`), which connects the seller's
@@ -497,6 +497,54 @@ behind `GET /links/:id/detail`.
 
 **200** — same shape as the `POST /links` response.
 **404** — `{ "error": "not_found" }`
+
+---
+
+## `GET /links/:id/pay-options`
+
+**Public — no auth.** The assets a buyer could pay this link with instead of the
+link's own asset, quoted for their wallet (issue 4.64). Only meaningful when
+`GET /links/:id` reports `pay.pathPayments: true`; the checkout asks for it once
+the buyer connects their wallet.
+
+`account` is required and must be the buyer's Stellar `G...` address. The quote
+is per account, because which paths exist depends on the assets that account
+can hold.
+
+**200**
+```json
+{
+  "options": [
+    {
+      "asset": { "code": "XLM", "issuer": null },
+      "sourceAmount": "24.12",
+      "maxSourceAmount": "24.3612"
+    }
+  ],
+  "expiresAt": 1750000090000
+}
+```
+
+- `sourceAmount` — what the quote says the buyer sends.
+- `maxSourceAmount` — that amount plus the deployment's slippage allowance
+  (`PATH_PAYMENTS_MAX_SLIPPAGE_BPS`, default 100 = 1%). This is the `sendMax` a
+  path payment carries.
+- `expiresAt` — server epoch ms for the whole set; the checkout re-quotes when it
+  passes. Absent when `options` is empty.
+
+The link's own asset is never listed — the checkout always offers it first.
+Each option costs one Horizon strict-receive quote, and the quote is advisory:
+price impact is enforced when the payment is built, not filtered out here.
+
+An empty `options` list is **not** an error: it means "pay in the link asset".
+That is also the answer when `PATH_PAYMENTS_ENABLED` is off, when the link is not
+`active`/`underpaid`, when the order book has no path, and when Horizon is
+unreachable.
+
+| Status | `error` | When |
+| --- | --- | --- |
+| `400` | `invalid_query` | `account` is missing or not a `G...` address |
+| `404` | `not_found` | No such link |
 
 ---
 
