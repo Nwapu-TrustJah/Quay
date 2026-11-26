@@ -1,13 +1,13 @@
 {
   "targets": {
     "api": {
-      "consecutiveFailures": 0,
-      "lastStatus": "up",
-      "lastCheckedAt": "2026-08-18T06:18:09.876Z",
+      "consecutiveFailures": 1,
+      "lastStatus": "down",
+      "lastCheckedAt": "2026-11-26T21:51:48.405Z",
       "today": {
-        "date": "2026-08-18",
-        "up": 4,
-        "down": 4
+        "date": "2026-11-26",
+        "up": 0,
+        "down": 1
       },
       "history": [
         {
@@ -114,17 +114,22 @@
           "date": "2026-08-17",
           "up": 39,
           "down": 1
+        },
+        {
+          "date": "2026-08-18",
+          "up": 4,
+          "down": 4
         }
       ],
-      "lastError": null
+      "lastError": "https://quay-api.onrender.com/health -> HTTP 503"
     },
     "web": {
       "consecutiveFailures": 0,
       "lastStatus": "up",
-      "lastCheckedAt": "2026-08-18T06:18:10.309Z",
+      "lastCheckedAt": "2026-11-26T21:51:48.608Z",
       "today": {
-        "date": "2026-08-18",
-        "up": 8,
+        "date": "2026-11-26",
+        "up": 1,
         "down": 0
       },
       "history": [
@@ -231,6 +236,11 @@
         {
           "date": "2026-08-17",
           "up": 40,
+          "down": 0
+        },
+        {
+          "date": "2026-08-18",
+          "up": 8,
           "down": 0
         }
       ],
