@@ -396,6 +396,53 @@ when no deployment you operate cashes out through an anchor at all. A
 payments-only mainnet (`OFFRAMP=none`) does not need the probe, but it is not a
 reason to disable it while testnet still does.
 
+### Nightly path payment probe
+
+`.github/workflows/path-payment-probe.yml` runs `apps/api/test/live/path-payment.live.test.ts`
+nightly at 05:00 UTC with `RUN_LIVE_PATH_TESTS=1`, in its own workflow: it used to
+be a step inside `anchor-probe.yml`, where `ANCHOR_PROBE_DISABLED=1` — documented
+for operators who cash out through no anchor — quietly turned off the gate too.
+The probe does not depend on an anchor.
+
+It verifies the end-to-end "pay with any asset" loop on live Stellar testnet, and
+every stage asserts the **API's** answer. Nothing falls back to Horizon, so a
+broken flow fails the job instead of being re-checked behind the API's back:
+1. **Self-seeded SDEX liquidity:** It creates a throwaway issuer, mints USDC,
+   funds a market maker via Friendbot, and places a `manageSellOffer` selling USDC
+   for XLM at a fixed price. The test never depends on public testnet liquidity,
+   and testnet resets do not break it.
+2. **Participant setup:** Funds a seller with a USDC trustline and a buyer holding
+   XLM only (no USDC trustline).
+3. **API boot:** Boots the real container in-process against a throwaway SQLite
+   database with `PATH_PAYMENTS_ENABLED=1`, mounts the real `/links` and `/r`
+   routes, and creates a 10 USDC link.
+4. **Pay options:** `GET /links/:id/pay-options` must offer XLM for the 10 USDC at
+   the seeded price; any failure other than the route not existing fails the job.
+5. **Price moved:** `POST /links/:id/submit` must refuse a `sendMax` far above the
+   API's own quote with `409 payment_rejected`, `reason: price_moved`.
+6. **Settlement:** `POST /links/:id/submit` relays the quoted
+   `path_payment_strict_receive`, the watcher matches it, and the link is `paid`
+   with exactly 10 USDC delivered.
+7. **What the buyer paid with:** `GET /r/:reference` must report `paidWith` XLM.
+
+**Dependencies.** Stages 4 and 7 need #548 (`GET /links/:id/pay-options`), stages
+5 and 6 need #549 (relaying a validated path payment), and stage 7 needs #550
+(record what the buyer paid with). Until those are on `dev`, the stage is skipped
+with the issue named in the skip message — it never re-checks Horizon. A probe run
+whose stages all skipped proves nothing, so read the summary before trusting a
+green job.
+
+**Production go-live requirement:** Turning `PATH_PAYMENTS_ENABLED=true` on in
+production (issue 8.30) strictly requires this nightly job to be green. Path
+payments stay disabled on mainnet until this live testnet suite has passed.
+
+**Run it locally:**
+`RUN_LIVE_PATH_TESTS=1 pnpm --filter @checkout/api exec vitest run test/live/path-payment.live.test.ts`
+(the file sets `PATH_PAYMENTS_ENABLED=1` for its own in-process container; the
+workflow sets it too, as the switch the probe gates).
+Without `RUN_LIVE_PATH_TESTS=1`, the test is skipped cleanly and normal test suites
+stay offline with zero network calls.
+
 ### Nightly refund probe
 
 `.github/workflows/refund-probe.yml` runs `apps/api/test/live/refund.live.test.ts`
@@ -432,61 +479,6 @@ endpoints land (issues #535, #537), the refund stages skip on the missing
 route — the pay half still runs live. For a manual run with accounts you
 already funded, pass `REFUND_PROBE_BUYER_SECRET` and
 `REFUND_PROBE_SELLER_SECRET` instead of the funder secret.
-
-### Nightly path-payment probe
-
-`.github/workflows/path-payment-probe.yml` runs
-`apps/api/test/live/path-payment.live.test.ts` nightly at 05:00 UTC (issue
-5.51). It creates a 10 USDC link for a throwaway seller, asks
-`GET /links/:id/pay-options` what that buyer could pay with instead, gets
-priced in XLM, then builds a real `pathPaymentStrictReceive` with the
-checkout's own builder (`apps/web/lib/payment-build.ts`, 5.48), signs it with
-the buyer's key in the test process, submits it through
-`POST /links/:id/submit`, and waits for the probe's own `WatcherLoop` to mark
-the link `paid` from the ledger. It finishes on the receipt and the seller's
-CSV export: both must say the buyer spent XLM on a USDC link. It is the live
-evidence behind `PATH_PAYMENTS_ENABLED`.
-
-**Why a USDC link paid in XLM.** The link asset has to be something the seller
-can hold and the buyer must be able to afford without a faucet. USDC is
-Circle's testnet issuer (`USDC_ISSUER_TESTNET`, the API's default) and XLM is
-what Friendbot hands out, and testnet already has an XLM ↔ USDC order book, so
-the probe fabricates no liquidity of its own. The seller gets Friendbot XLM and
-a USDC trustline the probe adds; the buyer only needs XLM.
-
-**No secrets to configure.** Both wallets are random per run and Friendbot
-funds them, so what the probe spends is testnet XLM, nothing that needs
-refilling. To reuse dedicated keys instead, set the repository Actions secrets
-`TEST_PATH_PAYMENT_BUYER_SECRET` / `TEST_PATH_PAYMENT_SELLER_SECRET`; they are
-optional. Never put a secret seed in a tracked file.
-
-**The flag is required.** `GET /links/:id/pay-options` reads
-`PATH_PAYMENTS_ENABLED` from the process environment, so the probe is run with
-`PATH_PAYMENTS_ENABLED=true`; the boot stage fails with an explicit message if
-it is off rather than passing vacuously.
-
-**Reading a failure.** Tests are named `stage N/6 <stage>` and later stages are
-skipped once one fails, so the first red test is where the flow broke:
-`prepare` (Friendbot or trustline), `boot` (API boot, link creation, the flag),
-`options` (the quote — usually no XLM ↔ USDC path on testnet), `build` (the
-re-quote, the price-impact cap, or the accepted `maxSourceAmount`),
-`pay` (submission, the watcher's `paid` transition, or the ledger operation),
-`receipt` (receipt `paidWith` or the CSV's `paid_with` column). The job summary
-also lists the quoted amount, `sendMax`, what was actually spent, the measured
-price impact and the two Horizon timings.
-
-**Run it locally:**
-
-```bash
-RUN_LIVE_PATH_TESTS=1 PATH_PAYMENTS_ENABLED=true \
-  pnpm --filter @checkout/api exec vitest run test/live/path-payment.live.test.ts --reporter=verbose
-```
-
-It is skipped, never failed, without `RUN_LIVE_PATH_TESTS`. The probe takes no
-credentials; if you pass `PATH_PAYMENT_PROBE_BUYER_SECRET`, that account is
-reused instead of a fresh one and must already hold XLM. Baseline latency on
-testnet is about 0.3–0.5 s per Horizon strict-receive call, so the build-time
-re-quote (full amount + 1% slice) adds roughly 0.3–1 s to a path payment.
 
 ## Deploy
 

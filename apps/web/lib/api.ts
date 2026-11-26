@@ -1,4 +1,5 @@
 import type {
+  AssetRef,
   KycFieldSpec,
   KycStatus,
   OffRampQuote,
@@ -22,41 +23,26 @@ export interface LinkWithRequest {
   };
 }
 
-/**
- * One asset the buyer could pay with INSTEAD of the link asset, priced for
- * their own account (issue 4.64, consumed by 5.47).
- *
- * Served by `GET /links/:id/pay-options` (issue 4.64,
- * apps/api/src/routes/links.ts); the quote itself comes from Horizon's
- * strict-receive paths for the buyer's own account.
- *
- * Both amounts are the quote's own figures: `sourceAmount` is the "about"
- * number the buyer should expect to send and `maxSourceAmount` is the
- * slippage-capped "at most" they can be charged. Neither is recomputed in the
- * UI — a client-side estimate would be a number nobody quoted.
- */
+/** One way to pay a link's outstanding amount with another asset (issue 4.64). */
 export interface PayOption {
-  /** The asset the buyer would send. `issuer` is null for XLM. */
-  asset: { code: string; issuer: string | null };
-  /** Estimated amount of `asset` the buyer sends. */
+  sourceAsset: AssetRef;
+  /** What the path costs right now, in `sourceAsset`. */
   sourceAmount: string;
-  /** Slippage-capped maximum amount of `asset` the buyer sends. */
-  maxSourceAmount: string;
-  /**
-   * Server epoch ms after which this quote is stale (compare with
-   * `serverNow()`, never `Date.now()`). Absent ⇒ no countdown, never a guess.
-   */
-  expiresAt?: number;
+  /** The most the buyer agrees to spend: `sourceAmount` plus the allowed slippage. */
+  sendMax: string;
+  /** Assets traded through between source and destination, in order. */
+  path: AssetRef[];
+  /** Epoch milliseconds. The quote stands until `expiresAt`. */
+  quotedAt: number;
+  expiresAt: number;
 }
 
-/**
- * Body of `GET /links/:id/pay-options` (issue 4.64). `expiresAt` here is shared
- * by every option and is copied onto options that don't carry their own.
- */
-export interface PayOptionsResponse {
-  options?: PayOption[];
-  /** Quote expiry shared by every option, when the API sends one. */
-  expiresAt?: number;
+/** `GET /links/:id/pay-options`: what an account can pay a link with (issue 4.64). */
+export interface PayOptions {
+  linkAsset: AssetRef;
+  /** The link's outstanding amount, which every option delivers. */
+  amount: string;
+  options: PayOption[];
 }
 
 /** One SEP-6 withdrawal type and the payout fields it needs (issue 5.24). */
@@ -652,6 +638,10 @@ export const api = {
 
   getLink: (id: string) => http<LinkWithRequest>(`/links/${id}`),
 
+  /** Which assets this account can pay the link with, and how much of each (issue 4.64). */
+  getPayOptions: (id: string, account: string) =>
+    http<PayOptions>(`/links/${id}/pay-options?account=${encodeURIComponent(account)}`),
+
   submitPayment: (id: string, signedXdr: string) =>
     http<{ txHash: string }>(`/links/${id}/submit`, {
       method: "POST",
@@ -666,29 +656,6 @@ export const api = {
   getReceipt: (reference: string) => http<PublicReceipt>(`/r/${reference}`),
 
   getPublicInvoice: (id: string) => http<PublicInvoice>(`/invoices/${id}/public`),
-
-  /**
-   * Other assets this buyer could pay the link with, quoted for `account`
-   * (issue 4.64). Only called when the link says `pay.pathPayments` (5.47).
-   * An empty array means "the link asset only" — never an error state.
-   *
-   * Wire contract (issue 4.64 — see `PayOption`):
-   *   GET /links/:id/pay-options?account=<G...>
-   *   200 { options: PayOption[], expiresAt?: number }
-   *   400 invalid_query for a missing/malformed account, 404 for an unknown link
-   * The account is the connected wallet, because the quote is per-buyer; the
-   * link's own `pay.pathPayments` flag stays the gate for calling this at all.
-   */
-  getPayOptions: async (id: string, account: string): Promise<PayOption[]> => {
-    const res = await http<PayOptionsResponse>(
-      `/links/${id}/pay-options?account=${encodeURIComponent(account)}`,
-    );
-    const shared = typeof res?.expiresAt === "number" ? res.expiresAt : undefined;
-    return (res?.options ?? []).map((option) => ({
-      ...option,
-      expiresAt: option.expiresAt ?? shared,
-    }));
-  },
 
   listInvoices: (status?: InvoiceStatus | "all" | string) =>
     http<{ invoices: Invoice[] }>(

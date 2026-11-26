@@ -1,5 +1,4 @@
 import { Hono, type MiddlewareHandler } from "hono";
-import { StrKey } from "@stellar/stellar-sdk";
 import {
   createLinkSchema,
   cashOutSchema,
@@ -150,29 +149,6 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
     });
   });
 
-  // The assets this buyer could pay with INSTEAD of the link asset, quoted for
-  // their own wallet (issue 4.64). Public like the other buyer-facing reads —
-  // the payer holds no seller session — and strictly rate-limited because every
-  // call asks Horizon for a path quote.
-  //
-  // Gated by construction: `c.payOptions` is wired only when
-  // PATH_PAYMENTS_ENABLED=true (services/container.ts), so with the flag off
-  // this answers "link asset only" without touching Horizon.
-  //
-  // An empty list is never an error: the checkout keeps today's one-asset
-  // payment. That covers a link that is not payable, an empty order book, and
-  // Horizon being unreachable.
-  app.get("/:id/pay-options", strictRateLimit, async (ctx) => {
-    const account = ctx.req.query("account");
-    if (!account || !StrKey.isValidEd25519PublicKey(account)) {
-      return ctx.json({ error: "invalid_query", message: "account must be a Stellar G... address" }, 400);
-    }
-    const result = await c.service.getLink(ctx.req.param("id"));
-    if (!result) return ctx.json({ error: "not_found" }, 404);
-    if (!c.payOptions) return ctx.json({ options: [] });
-    return ctx.json(await c.payOptions({ link: result.link, account }));
-  });
-
   // Indicative off-ramp prices — SEP-38 GET /prices, no firm quote consumed.
   // Safe to call on every dashboard load (issue 3.5).
   // Optional query param: ?currency=NGN — when provided, the indicative rate for
@@ -280,6 +256,29 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
   // guard mounted here, any key carrying only the default
   // links:read/links:write/webhooks:manage set could cash a paid link out — the
   // scope was documented and enforced nowhere.
+  // Which assets this buyer can pay the link with, and how much of each (issue
+  // 4.64). Public, like the submit route below: the caller is a buyer holding
+  // a link. Strict-rate-limited, because every call is a path search on
+  // Horizon. The answer is a price that stands for seconds, so nothing may
+  // cache it, a refusal included.
+  app.get("/:id/pay-options", strictRateLimit, async (ctx) => {
+    ctx.header("Cache-Control", "no-store");
+    try {
+      const result = await c.service.getPayOptions(ctx.req.param("id"), ctx.req.query("account") ?? "", {
+        logger: getLogger(ctx),
+      });
+      return ctx.json(result, 200);
+    } catch (err) {
+      if (err instanceof HttpError) {
+        return ctx.json(
+          { error: err.message, ...(err.extra ?? {}) },
+          err.status as 400 | 404 | 409 | 501 | 502 | 503,
+        );
+      }
+      throw err;
+    }
+  });
+
   // Relay a transaction the buyer signed in their own wallet (issue #31).
   // Public and strict-rate-limited: the payer is a buyer holding a link, not an
   // authenticated seller, so there is no account to gate on. The XDR itself is
@@ -294,7 +293,7 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
       return ctx.json(result, 200);
     } catch (err) {
       if (err instanceof HttpError) {
-        return ctx.json({ error: err.message, ...(err.extra ?? {}) }, err.status as 400 | 404 | 409 | 502);
+        return ctx.json({ error: err.message, ...(err.extra ?? {}) }, err.status as 400 | 404 | 409 | 502 | 503);
       }
       throw err;
     }

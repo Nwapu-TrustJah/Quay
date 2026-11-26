@@ -67,77 +67,6 @@ describe("api.exportCsv", () => {
   });
 });
 
-describe("api.getPayOptions (issue 4.64)", () => {
-  const realFetch = globalThis.fetch;
-
-  afterEach(() => {
-    globalThis.fetch = realFetch;
-    vi.restoreAllMocks();
-  });
-
-  function stubJson(body: unknown): ReturnType<typeof vi.fn> {
-    const fetchMock = vi.fn(
-      async () =>
-        new Response(JSON.stringify(body), {
-          status: 200,
-          headers: { "content-type": "application/json" },
-        }),
-    );
-    globalThis.fetch = fetchMock as unknown as typeof fetch;
-    return fetchMock;
-  }
-
-  it("asks for the buyer's account and applies the shared expiry to every option", async () => {
-    const fetchMock = stubJson({
-      options: [
-        { asset: { code: "XLM", issuer: null }, sourceAmount: "24.12", maxSourceAmount: "24.3612" },
-      ],
-      expiresAt: 1_800_000_090_000,
-    });
-
-    const options = await api.getPayOptions("lnk_1", "GBUYER");
-
-    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe(`${apiBase()}/links/lnk_1/pay-options?account=GBUYER`);
-    // One request returns every option; the server quotes them in one Horizon call.
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(options).toEqual([
-      {
-        asset: { code: "XLM", issuer: null },
-        sourceAmount: "24.12",
-        maxSourceAmount: "24.3612",
-        expiresAt: 1_800_000_090_000,
-      },
-    ]);
-  });
-
-  it("URL-encodes the account", async () => {
-    const fetchMock = stubJson({ options: [] });
-
-    await api.getPayOptions("lnk_1", "G B/1");
-
-    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe(`${apiBase()}/links/lnk_1/pay-options?account=G%20B%2F1`);
-  });
-
-  it("returns an empty list when the API offers only the link asset", async () => {
-    stubJson({ options: [] });
-
-    await expect(api.getPayOptions("lnk_1", "GBUYER")).resolves.toEqual([]);
-  });
-
-  it("surfaces a 404 as a CheckoutError", async () => {
-    globalThis.fetch = vi.fn(
-      async () => new Response('{"error":"not_found"}', { status: 404 }),
-    ) as unknown as typeof fetch;
-
-    await expect(api.getPayOptions("lnk_missing", "GBUYER")).rejects.toMatchObject({
-      code: "not_found",
-      status: 404,
-    });
-  });
-});
-
 /**
  * Issue #35: the checkout countdown is measured against the server's clock,
  * learned from the `Date` header, because a buyer's device can be minutes out
@@ -249,6 +178,73 @@ describe("api.quoteCashOut and api.cashOut", () => {
       payoutFields: { bank: "GTBank", account: "1234567890" },
       quoteId: "quote_123",
     });
+  });
+});
+
+describe("api.getPayOptions", () => {
+  const realFetch = globalThis.fetch;
+  const ACCOUNT = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
+
+  afterEach(() => {
+    globalThis.fetch = realFetch;
+    vi.restoreAllMocks();
+  });
+
+  it("calls GET /links/:id/pay-options with the account in the query and returns the options", async () => {
+    const payload = {
+      linkAsset: { code: "USDC", issuer: ACCOUNT },
+      amount: "10",
+      options: [
+        {
+          sourceAsset: { code: "XLM", issuer: null },
+          sourceAmount: "24.1234567",
+          sendMax: "24.3646913",
+          path: [],
+          quotedAt: 1763560000000,
+          expiresAt: 1763560030000,
+        },
+      ],
+    };
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify(payload), { status: 200 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const result = await api.getPayOptions("lnk_1", ACCOUNT);
+
+    expect(result).toEqual(payload);
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe(`${apiBase()}/links/lnk_1/pay-options?account=${ACCOUNT}`);
+    expect(init.method).toBeUndefined();
+    // A quote stands for seconds: the request must not be answered from a cache.
+    expect(init.cache).toBe("no-store");
+  });
+
+  it("encodes the account, so nothing typed into it can add to the query", async () => {
+    const fetchMock = vi.fn(async () => new Response('{"error":"invalid_account"}', { status: 400 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    await expect(api.getPayOptions("lnk_1", "G A&account=GOTHER#x")).rejects.toBeInstanceOf(CheckoutError);
+    const [url] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    expect(url).toBe(`${apiBase()}/links/lnk_1/pay-options?account=G%20A%26account%3DGOTHER%23x`);
+  });
+
+  it("keeps the status and what the refusal carries, so a caller can tell off from down", async () => {
+    const refusal = async (status: number, body: Record<string, unknown>) => {
+      globalThis.fetch = vi.fn(async () => new Response(JSON.stringify(body), { status })) as unknown as typeof fetch;
+      return api.getPayOptions("lnk_1", ACCOUNT).then(
+        () => null,
+        (err: unknown) => err as CheckoutError,
+      );
+    };
+
+    const off = await refusal(501, { error: "path_payments_disabled" });
+    expect(off).toBeInstanceOf(CheckoutError);
+    expect(off!.status).toBe(501);
+    expect(off!.message).toContain("path_payments_disabled");
+
+    const down = await refusal(503, { error: "horizon_unavailable", retryable: true });
+    expect(down!.status).toBe(503);
+    expect(down!.message).toContain("horizon_unavailable");
+    expect(down!.details).toEqual({ retryable: true });
   });
 });
 

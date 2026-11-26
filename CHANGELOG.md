@@ -75,6 +75,11 @@ operator or integrator can observe are repeated here.
 - `pnpm secrets:mainnet` no longer generates `DEFAULT_SELLER_*` keys.
 - `STELLAR_NETWORK` is no longer read by the web app; the explorer follows
   `NEXT_PUBLIC_STELLAR_NETWORK`.
+- `PATH_PAYMENTS_SOURCE_ASSETS` (default `native`) and `PATH_QUOTE_TTL_MS`
+  (default `30000`, a whole number from `1000` to `300000`): which assets a
+  buyer may be quoted in by `GET /links/:id/pay-options`, as a comma-separated
+  list of `native` and `CODE:ISSUER`, and how long such a quote stands. A
+  malformed value stops the API from booting.
 
 The authoritative list is [`.env.example`](./.env.example); `pnpm
 docs:check-env-docs` keeps it in step with the code.
@@ -129,6 +134,10 @@ docs:check-env-docs` keeps it in step with the code.
   testanchor (auth, KYC, quote, withdraw, transfer, settlement).
 - Playwright payment-loop end-to-end tests and the `pnpm sweep` pre-entry ritual.
 - Widget API and `postMessage` contract docs; `apps/web` README.
+- `GET /links/:id/pay-options?account=G...`: what a buyer's account can pay a
+  link with besides the link's own asset, and how much of each, quoted for the
+  outstanding amount. It answers `501 path_payments_disabled` unless paying
+  with another asset is switched on, which it is not by default.
 
 ### Changed
 
@@ -163,6 +172,12 @@ docs:check-env-docs` keeps it in step with the code.
 - Seller anchor sessions are revoked on logout and wallet change, expired
   sessions are swept hourly, and cash-out polling skips sellers whose session
   lapsed.
+- `POST /links/:id/submit` also relays a strict-receive path payment while
+  paying with another asset is switched on. It refuses one whose source asset
+  is not on `PATH_PAYMENTS_SOURCE_ASSETS`, that does not expire with its quote,
+  or whose `sendMax` is above twice the allowed slippage over the current
+  price, and answers `503 horizon_unavailable` when it cannot get that price.
+  With the switch off the endpoint behaves as before.
 
 ### Fixed
 

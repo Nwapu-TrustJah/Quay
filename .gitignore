@@ -29,5 +29,3 @@ packages/offramp/probe-telemetry.json
 packages/offramp/probe-telemetry.json.lock
 apps/api/refund-probe-telemetry.json
 apps/api/refund-probe-telemetry.json.lock
-apps/api/path-payment-probe-telemetry.json
-apps/api/path-payment-probe-telemetry.json.lock

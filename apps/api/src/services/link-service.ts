@@ -51,13 +51,22 @@ import {
   isAnchorRejection,
   truncateAnchorBody,
 } from "@checkout/offramp";
-import { isNotFound, resolveAsset, type StellarConfig } from "@checkout/stellar";
-import { Horizon, Operation, Transaction, type Memo } from "@stellar/stellar-sdk";
+import {
+  isNotFound,
+  isRetryable,
+  quoteStrictReceive,
+  resolveAsset,
+  sendMaxFor,
+  type PathQuote,
+  type StellarConfig,
+} from "@checkout/stellar";
+import { Horizon, Operation, StrKey, Transaction, type Asset, type Memo } from "@stellar/stellar-sdk";
 import { newId, newMuxedId, newReference } from "./ids";
 import { WebhookSender } from "./webhook-sender";
 import { AnchorHealthRegistry, type AnchorHealth, type AnchorHealthSnapshot } from "./anchor-health";
 import { metrics, recordAnchorAuthRequired, type AnchorAuthRoute } from "../metrics";
 import type { PiiAuditRecorder } from "./pii-audit";
+import type { PathPaymentsConfig, PayOptions } from "../path-payments";
 
 // Re-exported for callers that historically imported them from LinkService
 // (issue 3.23 moved the implementation into ./anchor-health).
@@ -315,6 +324,11 @@ export class LinkService {
       logger?: Logger;
       /** Audit log for system reads of seller identity (the cash-out KYC gate). Omitted = not audited. */
       piiAudit?: PiiAuditRecorder;
+      /**
+       * Paying a link with another asset (issues 8.30, 4.64). Omitted, or with
+       * `enabled` false, the feature is off and `getPayOptions` answers 501.
+       */
+      pathPayments?: PathPaymentsConfig;
       /**
        * Buyer's Horizon account for refund preflight. Tests inject this.
        * Omitted, the service loads it from Horizon. TODO(2.14): drop this once
@@ -717,33 +731,34 @@ export class LinkService {
       );
     }
     const op = tx.operations[0]!;
-    // Issue 5.48: a strict-receive path payment delivers the same thing as a
-    // plain payment — the link asset to the link destination — with the buyer's
-    // own asset converted on the way. Both are validated on their *delivered*
-    // side, which is what the watcher settles on, so the checks below are shared.
-    const isPathPayment = op.type === "pathPaymentStrictReceive";
-    if (op.type !== "payment" && !isPathPayment) {
-      throw new HttpError(
-        400,
-        `Transaction must be a single payment or path payment operation, got "${op.type}"`,
-      );
+    // A strict-receive path payment is a second accepted shape while paying
+    // with another asset is switched on (issues 8.30, 4.65). With the switch
+    // off nothing here changes: it is refused like any other operation.
+    const paths = this.deps.pathPayments?.enabled ? this.deps.pathPayments : undefined;
+    const pathPayment =
+      paths && op.type === "pathPaymentStrictReceive" ? (op as Operation.PathPaymentStrictReceive) : null;
+    if (op.type !== "payment" && !pathPayment) {
+      if (paths && op.type === "pathPaymentStrictSend") {
+        // Strict-send fixes what the buyer spends and lets what arrives float.
+        throw new HttpError(
+          400,
+          'Transaction must be a payment or a strict-receive path payment, got "pathPaymentStrictSend": ' +
+            "a strict-send path payment can deliver less than the link asks for",
+        );
+      }
+      throw new HttpError(400, `Transaction must be a single payment operation, got "${op.type}"`);
     }
-    const payment = op as Operation.Payment | Operation.PathPaymentStrictReceive;
+    // What the operation delivers, whichever of the two it is. Every check
+    // from here to the memo is on the destination side, and holds for both.
+    const payment = pathPayment
+      ? { destination: pathPayment.destination, asset: pathPayment.destAsset, amount: pathPayment.destAmount }
+      : (op as Operation.Payment);
 
     // A per-operation source lets the envelope move value out of an account
     // other than the signer's. Nothing about this flow needs it.
-    if (payment.source && payment.source !== tx.source) {
+    if (op.source && op.source !== tx.source) {
       throw new HttpError(400, "Payment operation must not override the transaction source account");
     }
-
-    // Delivered side of the operation: `asset`/`amount` for a payment,
-    // `destAsset`/`destAmount` for a path payment.
-    const deliveredAsset = isPathPayment
-      ? (payment as Operation.PathPaymentStrictReceive).destAsset
-      : (payment as Operation.Payment).asset;
-    const deliveredAmount = isPathPayment
-      ? (payment as Operation.PathPaymentStrictReceive).destAmount
-      : (payment as Operation.Payment).amount;
 
     // ---- destination, asset, amount, memo ---------------------------------
     const expectedDestination = this.deps.rail.buildRequest({
@@ -757,12 +772,7 @@ export class LinkService {
       throw new HttpError(409, "Transaction destination does not match the link destination");
     }
 
-    // `getIssuer()` is typed as possibly-undefined even on a non-native asset;
-    // normalise to null so `assetEquals` compares like with like rather than
-    // silently treating an issued asset as native.
-    const txAsset: AssetRef = deliveredAsset.isNative()
-      ? { code: "XLM", issuer: null }
-      : { code: deliveredAsset.getCode(), issuer: deliveredAsset.getIssuer() ?? null };
+    const txAsset = assetRefOf(payment.asset);
     if (!assetEquals(txAsset, link.asset)) {
       throw new HttpError(
         409,
@@ -774,12 +784,11 @@ export class LinkService {
     // accounting. For an underpaid link, only the outstanding amount remains
     // due; requiring the original invoice amount here would make the wallet
     // path unable to complete split payments.
-    const outstandingStroops = toStroops(link.amount) - (link.paidAmount ? toStroops(link.paidAmount) : 0n);
-    const outstanding = fromStroops(outstandingStroops > 0n ? outstandingStroops : 0n);
-    if (compareAmount(deliveredAmount, outstanding) === "under") {
+    const outstanding = outstandingAmount(link);
+    if (compareAmount(payment.amount, outstanding) === "under") {
       throw new HttpError(
         409,
-        `Amount too low: link expects ${outstanding}, transaction sends ${deliveredAmount}`,
+        `Amount too low: link expects ${outstanding}, transaction sends ${payment.amount}`,
       );
     }
 
@@ -791,6 +800,8 @@ export class LinkService {
         throw new HttpError(409, "Transaction memo does not match the link reference");
       }
     }
+
+    if (pathPayment) await this.assertPathPaymentIsBounded(tx, pathPayment, link, paths!, log);
 
     const server = new Horizon.Server(this.deps.stellar.horizonUrl);
     try {
@@ -816,6 +827,174 @@ export class LinkService {
       log.warn({ event: "payment.submit.failed", linkId: link.id, error: detail, reason }, "wallet submit rejected");
       throw new HttpError(409, "payment_rejected", { reason, detail });
     }
+  }
+
+  /**
+   * What a path payment has to pass beyond a plain payment's checks (issue
+   * 4.65). It has a source side a plain payment does not: an asset, a path,
+   * and the most the buyer agrees to spend. A broken or tampered checkout can
+   * set those against the buyer, and a signed transaction with no near expiry
+   * can land minutes later at a much worse price.
+   *
+   * The cheap checks come first. The quote is last, so Horizon is asked only
+   * about a transaction that is otherwise acceptable.
+   */
+  private async assertPathPaymentIsBounded(
+    tx: Transaction,
+    op: Operation.PathPaymentStrictReceive,
+    link: PaymentLink,
+    config: PathPaymentsConfig,
+    log: Logger,
+  ): Promise<void> {
+    const sendAsset = assetRefOf(op.sendAsset);
+    if (assetEquals(sendAsset, link.asset)) {
+      throw new HttpError(
+        400,
+        `Path payment must send another asset than ${link.asset.code}: pay the link's own asset with a plain payment`,
+      );
+    }
+    if (!config.sourceAssets.some((allowed) => assetEquals(allowed, sendAsset))) {
+      throw new HttpError(409, `Source asset ${sendAsset.code} is not accepted for path payments`, {
+        reason: "source_asset_not_allowed",
+      });
+    }
+    // The protocol's own limit. Refused here so that it is not Horizon that
+    // says so, after everything else was accepted.
+    if (op.path.length > MAX_PATH_ASSETS) {
+      throw new HttpError(
+        400,
+        `Path payment has ${op.path.length} path assets, at most ${MAX_PATH_ASSETS} are allowed`,
+      );
+    }
+
+    // The transaction has to expire with the quote it was built from. Without
+    // a `maxTime`, or with a distant one, it could be held back and submitted
+    // when the path costs the buyer far more, up to `sendMax`.
+    const maxTime = Number(tx.timeBounds?.maxTime ?? 0);
+    if (!Number.isFinite(maxTime) || maxTime <= 0) {
+      throw new HttpError(400, "Path payment must expire: the transaction has no timeBounds.maxTime");
+    }
+    const now = (config.now ?? Date.now)();
+    const latest = Math.floor((now + config.quoteTtlMs + PATH_EXPIRY_GRACE_MS) / 1000);
+    if (maxTime > latest) {
+      throw new HttpError(
+        400,
+        `Path payment expires too late: timeBounds.maxTime is ${maxTime}, at most ${latest} is allowed`,
+      );
+    }
+
+    // `sendMax` against what the path costs now. The checkout adds the allowed
+    // slippage once; twice that is the most a correct checkout can be off by
+    // while a quote stands, so anything above it was not built from a quote.
+    let quotes: PathQuote[];
+    try {
+      quotes = await quoteStrictReceive({
+        client: config.horizon,
+        source: [sendAsset],
+        destAsset: link.asset,
+        destAmount: normalizeAmount(op.destAmount),
+      });
+    } catch (err) {
+      // Fail closed: with no price to hold `sendMax` to, nothing is relayed.
+      log.warn(
+        {
+          event: "payment.submit.quote_failed",
+          linkId: link.id,
+          error: err instanceof Error ? err.message : String(err),
+        },
+        "path payment not relayed: no quote to check it against",
+      );
+      throw new HttpError(503, "horizon_unavailable", { retryable: true });
+    }
+    const quote = quotes.find((candidate) => assetEquals(candidate.sourceAsset, sendAsset));
+    if (!quote) {
+      throw new HttpError(409, "payment_rejected", {
+        reason: "no_path",
+        detail: `No path from ${sendAsset.code} to ${link.asset.code} right now`,
+      });
+    }
+    const limit = sendMaxFor(quote.sourceAmount, 2 * config.maxSlippageBps);
+    if (toStroops(op.sendMax) > toStroops(limit)) {
+      throw new HttpError(409, "payment_rejected", {
+        reason: "price_moved",
+        detail: `sendMax ${normalizeAmount(op.sendMax)} ${sendAsset.code} is above ${limit}, the most allowed for a path that costs ${quote.sourceAmount} now`,
+      });
+    }
+  }
+
+  /**
+   * What a buyer's account can pay this link with besides the link's own
+   * asset, and how much of each it takes right now (issue 4.64).
+   *
+   * The path search runs here and not in the browser, so that the slippage,
+   * the allowlist of source assets and the lifetime of a quote are the
+   * server's. What `submitPayment` later holds a path payment to has to come
+   * from the same place that quoted it.
+   *
+   * Only the outstanding amount is quoted, the amount `submitPayment`
+   * requires, so an underpaid link is not offered a path that pays it twice.
+   */
+  async getPayOptions(linkId: string, account: string, opts: ServiceCallOptions = {}): Promise<PayOptions> {
+    const log = opts.logger ?? this.deps.logger!;
+    const config = this.deps.pathPayments;
+    // The switch comes first: while it is off this endpoint does not exist,
+    // whatever was asked of it.
+    if (!config?.enabled) throw new HttpError(501, "path_payments_disabled");
+    if (!StrKey.isValidEd25519PublicKey(account)) throw new HttpError(400, "invalid_account");
+
+    const link = await this.deps.links.findById(linkId);
+    if (!link) throw new HttpError(404, "not_found");
+    if (link.status !== "active" && link.status !== "underpaid") {
+      throw new HttpError(409, "link_not_payable", { status: link.status });
+    }
+
+    const amount = outstandingAmount(link);
+    // Stamped before Horizon is asked, so a quote never claims to be younger
+    // than it is.
+    const quotedAt = (config.now ?? Date.now)();
+    let quotes: PathQuote[] = [];
+    // Nothing owed is nothing to quote, and Horizon refuses a zero amount.
+    if (toStroops(amount) > 0n) {
+      try {
+        quotes = await quoteStrictReceive({
+          client: config.horizon,
+          source: account,
+          destAsset: link.asset,
+          destAmount: amount,
+        });
+      } catch (err) {
+        // Horizon answers 404 for an account that is not on the ledger. Such a
+        // buyer holds nothing to pay with, which is an answer and not an outage.
+        if (!isNotFound(err)) {
+          const retryable = isRetryable(err);
+          log.warn(
+            {
+              event: "pay_options.quote_failed",
+              linkId: link.id,
+              retryable,
+              error: err instanceof Error ? err.message : String(err),
+            },
+            "path quote failed",
+          );
+          // No response, a 429 or a 5xx: Horizon is unavailable and asking
+          // again may work. Any other refusal would be refused again.
+          if (retryable) throw new HttpError(503, "horizon_unavailable", { retryable: true });
+          throw new HttpError(502, "quote_failed", { retryable: false });
+        }
+      }
+    }
+
+    const options = quotes
+      .filter((quote) => config.sourceAssets.some((allowed) => assetEquals(allowed, quote.sourceAsset)))
+      .map((quote) => ({
+        sourceAsset: quote.sourceAsset,
+        sourceAmount: quote.sourceAmount,
+        sendMax: sendMaxFor(quote.sourceAmount, config.maxSlippageBps),
+        path: quote.path,
+        quotedAt,
+        expiresAt: quotedAt + config.quoteTtlMs,
+      }));
+    return { linkAsset: link.asset, amount, options };
   }
 
   async cancelLink(id: string): Promise<PaymentLink> {
@@ -1910,6 +2089,34 @@ function offRampRejected(err: OffRampRejectedError): HttpError {
     limits: err.limits,
     availableTypes: err.availableTypes,
   });
+}
+
+/** The most intermediate assets the protocol allows in a path payment. */
+const MAX_PATH_ASSETS = 5;
+
+/**
+ * How much later than its quote a path payment may expire: room for the
+ * wallet prompt and for clocks that disagree a little.
+ */
+const PATH_EXPIRY_GRACE_MS = 30_000;
+
+/**
+ * An SDK asset as an `AssetRef`. `getIssuer()` is typed as possibly-undefined
+ * even on a non-native asset; it becomes null so that `assetEquals` compares
+ * like with like and does not take an issued asset for native.
+ */
+function assetRefOf(asset: Asset): AssetRef {
+  return asset.isNative() ? { code: "XLM", issuer: null } : { code: asset.getCode(), issuer: asset.getIssuer() ?? null };
+}
+
+/**
+ * What a link still owes: its amount less what has been paid toward it, never
+ * below zero. An underpaid link owes only this, which is why the submit check
+ * and the path quote both start from it and not from `link.amount`.
+ */
+function outstandingAmount(link: Pick<PaymentLink, "amount" | "paidAmount">): string {
+  const owed = toStroops(link.amount) - (link.paidAmount ? toStroops(link.paidAmount) : 0n);
+  return fromStroops(owed > 0n ? owed : 0n);
 }
 
 export class HttpError extends Error {

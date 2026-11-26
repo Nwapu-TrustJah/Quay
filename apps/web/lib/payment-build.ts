@@ -54,9 +54,10 @@ export interface PaymentHorizon extends HorizonClient {
 }
 
 export interface PathPaymentOption {
-  asset: AssetRef;
+  /** The asset the buyer would send instead of the link asset (`PayOption.sourceAsset`). */
+  sourceAsset: AssetRef;
   /** The slippage-capped amount the buyer accepted when they chose this asset. */
-  maxSourceAmount: string;
+  sendMax: string;
 }
 
 export interface PlanPathPaymentInput {
@@ -83,7 +84,7 @@ export interface PlannedPathPayment {
 }
 
 /**
- * Re-quotes `option.asset` for the outstanding destination amount and refuses
+ * Re-quotes `option.sourceAsset` for the outstanding destination amount and refuses
  * the payment when the fresh price is outside what the buyer accepted:
  *
  * - no path (or a path that vanished between the panel and the press)
@@ -106,11 +107,11 @@ export async function planPathPayment(
     destAsset,
     destAmount,
   });
-  const fresh = quotes.find((quote) => sameAsset(quote.sourceAsset, option.asset));
+  const fresh = quotes.find((quote) => sameAsset(quote.sourceAsset, option.sourceAsset));
   if (!fresh) {
     throw new PathPaymentError(
       "no_path",
-      `There is no path from ${option.asset.code} to ${destAsset.code}.`,
+      `There is no path from ${option.sourceAsset.code} to ${destAsset.code}.`,
     );
   }
 
@@ -123,11 +124,11 @@ export async function planPathPayment(
     destAsset,
     destAmount: sliceDestAmount,
   });
-  const slice = sliceQuotes.find((quote) => sameAsset(quote.sourceAsset, option.asset));
+  const slice = sliceQuotes.find((quote) => sameAsset(quote.sourceAsset, option.sourceAsset));
   if (!slice) {
     throw new PathPaymentError(
       "no_path",
-      `There is no path from ${option.asset.code} to ${destAsset.code}.`,
+      `There is no path from ${option.sourceAsset.code} to ${destAsset.code}.`,
     );
   }
 
@@ -142,14 +143,14 @@ export async function planPathPayment(
   if (options.length === 0) {
     throw new PathPaymentError(
       "no_path",
-      `Paying in ${option.asset.code} would cost ${impact} bps more than the market price, above the ${maxPriceImpactBps} bps limit.`,
+      `Paying in ${option.sourceAsset.code} would cost ${impact} bps more than the market price, above the ${maxPriceImpactBps} bps limit.`,
     );
   }
 
-  if (toStroops(fresh.sourceAmount) > toStroops(option.maxSourceAmount)) {
+  if (toStroops(fresh.sourceAmount) > toStroops(option.sendMax)) {
     throw new PathPaymentError(
       "price_moved",
-      `The ${option.asset.code} price moved: this payment now needs ${fresh.sourceAmount}, but at most ${option.maxSourceAmount} was quoted.`,
+      `The ${option.sourceAsset.code} price moved: this payment now needs ${fresh.sourceAmount}, but at most ${option.sendMax} was quoted.`,
     );
   }
 
@@ -157,7 +158,7 @@ export async function planPathPayment(
     sourceAsset: fresh.sourceAsset,
     sourceAmount: fresh.sourceAmount,
     path: fresh.path,
-    maxSourceAmount: option.maxSourceAmount,
+    maxSourceAmount: option.sendMax,
     priceImpactBps: impact,
   };
 }

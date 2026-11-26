@@ -100,9 +100,12 @@ function link(over: Partial<LinkWithRequest["link"]> = {}): LinkWithRequest {
 
 /** A quoted path-payment option: 10 USDC is worth about 24.12 XLM to this buyer. */
 const XLM_OPTION: PayOption = {
-  asset: { code: "XLM", issuer: null },
+  sourceAsset: { code: "XLM", issuer: null },
   sourceAmount: "24.12",
-  maxSourceAmount: "24.36",
+  sendMax: "24.36",
+  path: [],
+  quotedAt: 1_763_560_000_000,
+  expiresAt: 1_763_560_030_000,
 };
 
 /** The same link, but with the pay-in-any-asset flag on. */
@@ -151,7 +154,7 @@ describe("WalletPayButton", () => {
     vi.useRealTimers();
     apiMock.getLink.mockResolvedValue(link());
     apiMock.submitPayment.mockResolvedValue({ txHash: "tx_abc" });
-    apiMock.getPayOptions.mockResolvedValue([]);
+    apiMock.getPayOptions.mockResolvedValue({ options: [] });
     sdk.loadAccount.mockResolvedValue(fundedAccount);
     container = document.createElement("div");
     document.body.appendChild(container);
@@ -304,7 +307,7 @@ describe("WalletPayButton", () => {
       ["missing", undefined],
       ["false", { pathPayments: false, maxSlippageBps: 100 }],
     ])("keeps the existing payment when pay.pathPayments is %s", async (_label, payFlag) => {
-      apiMock.getPayOptions.mockResolvedValue([XLM_OPTION]);
+      apiMock.getPayOptions.mockResolvedValue({ options: [XLM_OPTION] });
       await mount({ ...link(), pay: payFlag as unknown as LinkWithRequest["pay"] });
       await pay();
 
@@ -314,7 +317,7 @@ describe("WalletPayButton", () => {
     });
 
     it("keeps the existing payment when the API quotes no other asset", async () => {
-      apiMock.getPayOptions.mockResolvedValue([]);
+      apiMock.getPayOptions.mockResolvedValue({ options: [] });
       await mount(pathLink());
       await pay();
 
@@ -324,7 +327,7 @@ describe("WalletPayButton", () => {
     });
 
     it("lists the link asset first, then each quoted asset, and pays with the chosen one", async () => {
-      apiMock.getPayOptions.mockResolvedValue([XLM_OPTION]);
+      apiMock.getPayOptions.mockResolvedValue({ options: [XLM_OPTION] });
       const build = vi.fn().mockResolvedValue("UNSIGNED_XDR");
       await mount(pathLink(), { buildTransaction: build });
       await pay();
@@ -355,14 +358,14 @@ describe("WalletPayButton", () => {
       expect(build).toHaveBeenCalledWith(
         expect.objectContaining({
           address: "GBUYER",
-          payOption: expect.objectContaining({ asset: { code: "XLM", issuer: null } }),
+          payOption: expect.objectContaining({ sourceAsset: { code: "XLM", issuer: null } }),
         }),
       );
       expect(onSubmitted).toHaveBeenCalledWith("tx_abc");
     });
 
     it("builds and submits the chosen asset as a path payment (issue 5.48)", async () => {
-      apiMock.getPayOptions.mockResolvedValue([XLM_OPTION]);
+      apiMock.getPayOptions.mockResolvedValue({ options: [XLM_OPTION] });
       // Horizon quotes the same XLM path for the full amount and the 1% slice.
       sdk.paths.push({ source_asset_type: "native", source_amount: "24.12", path: [] });
       await mount(pathLink());
@@ -386,7 +389,7 @@ describe("WalletPayButton", () => {
     });
 
     it("keeps the buyer's choice when there is no path left at build time", async () => {
-      apiMock.getPayOptions.mockResolvedValue([XLM_OPTION]);
+      apiMock.getPayOptions.mockResolvedValue({ options: [XLM_OPTION] });
       // The panel quoted XLM, but the book is gone by the time they press pay.
       sdk.paths.length = 0;
       await mount(pathLink());
@@ -405,7 +408,7 @@ describe("WalletPayButton", () => {
     it("keeps the chosen asset when the re-quote request fails, rather than reverting to the link asset", async () => {
       vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
       apiMock.getPayOptions
-        .mockResolvedValueOnce([{ ...XLM_OPTION, expiresAt: Date.now() + 2_000 }])
+        .mockResolvedValueOnce({ options: [{ ...XLM_OPTION, expiresAt: Date.now() + 2_000 }] })
         .mockRejectedValueOnce(new Error("quote service down"));
       await mount(pathLink());
       await pay();
@@ -426,10 +429,12 @@ describe("WalletPayButton", () => {
     it("counts the quote down and re-quotes when it expires, keeping the chosen asset", async () => {
       vi.useFakeTimers({ toFake: ["setInterval", "clearInterval", "Date"] });
       apiMock.getPayOptions
-        .mockResolvedValueOnce([{ ...XLM_OPTION, expiresAt: Date.now() + 2_000 }])
-        .mockResolvedValueOnce([
-          { ...XLM_OPTION, sourceAmount: "24.20", maxSourceAmount: "24.44", expiresAt: Date.now() + 120_000 },
-        ]);
+        .mockResolvedValueOnce({ options: [{ ...XLM_OPTION, expiresAt: Date.now() + 2_000 }] })
+        .mockResolvedValueOnce({
+          options: [
+            { ...XLM_OPTION, sourceAmount: "24.20", sendMax: "24.44", expiresAt: Date.now() + 120_000 },
+          ],
+        });
       await mount(pathLink());
       await pay();
       await act(async () => radios()[1]!.click());

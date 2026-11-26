@@ -79,7 +79,7 @@ class FakeHorizon implements PaymentHorizon {
   }
 }
 
-const option = { asset: XLM, maxSourceAmount: "24.36" };
+const option = { sourceAsset: XLM, sendMax: "24.36" };
 
 /** Full amount 13 XLM for 10 USDC, 1% slice at 0.12 XLM for 0.1 USDC:
  *  the full quote is ~833 bps worse per unit than the slice. */
@@ -139,7 +139,7 @@ describe("planPathPayment (issue 5.48)", () => {
         buyer: BUYER,
         destAsset: USDC,
         destAmount: "10",
-        option: { asset: XLM, maxSourceAmount: "100" },
+        option: { sourceAsset: XLM, sendMax: "100" },
         maxPriceImpactBps: 300,
       }),
     ).rejects.toMatchObject({ code: "no_path" });
@@ -156,7 +156,7 @@ describe("planPathPayment (issue 5.48)", () => {
       buyer: BUYER,
       destAsset: USDC,
       destAmount: "10",
-      option: { asset: XLM, maxSourceAmount: "10.4" },
+      option: { sourceAsset: XLM, sendMax: "10.4" },
       maxPriceImpactBps: 300,
     });
 
@@ -313,7 +313,7 @@ describe("buildPaymentXdr asset choice (issue 5.48)", () => {
       {
         address: BUYER,
         initial: linkFixture(),
-        payOption: { asset: XLM, sourceAmount: "24.12", maxSourceAmount: "24.36" },
+        payOption: { sourceAsset: XLM, sendMax: "24.36" },
       },
       { horizon },
     );
@@ -333,7 +333,7 @@ describe("buildPaymentXdr asset choice (issue 5.48)", () => {
         {
           address: BUYER,
           initial: linkFixture(),
-          payOption: { asset: XLM, sourceAmount: "13", maxSourceAmount: "100" },
+          payOption: { sourceAsset: XLM, sendMax: "100" },
         },
         { horizon: thinBook() },
       ),
@@ -352,7 +352,7 @@ describe("buildPaymentXdr asset choice (issue 5.48)", () => {
         initial: linkFixture({
           link: { id: "lnk_1", status: "underpaid", amount: "10", paidAmount: "6" },
         } as Partial<LinkWithRequest>),
-        payOption: { asset: XLM, sourceAmount: "9.5", maxSourceAmount: "9.6" },
+        payOption: { sourceAsset: XLM, sendMax: "9.6" },
       },
       { horizon },
     );

@@ -14,11 +14,11 @@ export function sameAsset(
 
 /** "about 24.12 XLM, at most 24.36 XLM" — the quote's own figures (issue 5.47). */
 export function formatPayOption(option: PayOption): string {
-  const code = option.asset.code;
+  const code = option.sourceAsset.code;
   // Amount and code are glued with a no-break space: on a 375px screen the
   // option wraps, and a plain space leaves the asset code alone on line two
   // ("…at most 24.36" / "XLM"). Wrapping before the amount reads as a pair.
-  return `about ${option.sourceAmount}\u00A0${code}, at most ${option.maxSourceAmount}\u00A0${code}`;
+  return `about ${option.sourceAmount}\u00A0${code}, at most ${option.sendMax}\u00A0${code}`;
 }
 
 /**
@@ -115,12 +115,12 @@ export default function PayWithChoice({
       </label>
 
       {options.map((option, index) => (
-        <label key={`${option.asset.code}:${option.asset.issuer ?? "native"}:${index}`}>
+        <label key={`${option.sourceAsset.code}:${option.sourceAsset.issuer ?? "native"}:${index}`}>
           <input
             type="radio"
             name="payAsset"
-            value={option.asset.code}
-            checked={selected !== null && sameAsset(selected.asset, option.asset)}
+            value={option.sourceAsset.code}
+            checked={selected !== null && sameAsset(selected.sourceAsset, option.sourceAsset)}
             onChange={() => onSelect(option)}
           />
           <span>{formatPayOption(option)}</span>

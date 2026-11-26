@@ -6,8 +6,8 @@ The API is served by `@checkout/api` (Hono) on `http://localhost:8787` by defaul
 > **Auth:** `POST /auth` issues a session JWT after a wallet-signed SEP-10
 > challenge; a seller row is created for the wallet on first login. **`/links`
 > and `/webhooks` require it**, except the public checkout reads
-> (`GET /links/:id`, `GET /links/:id/pay-options`, `POST /links/:id/submit`) and
-> `GET /r/:reference`: every other route under those prefixes needs
+> (`GET /links/:id`, `POST /links/:id/submit`) and `GET /r/:reference`: every
+> other route under those prefixes needs
 > `Authorization: Bearer <token>` (or the httpOnly `session` cookie set by
 > `POST /auth`) and returns `401` without one. The web UI provides wallet login via
 > `SessionGate` (`apps/web/app/components/SessionGate.tsx`), which connects the seller's
@@ -112,7 +112,7 @@ Rate limit buckets are keyed by client IP (respecting `trustProxyHops`), or by t
 - **Standard limiter**: `RATE_LIMIT_MAX` requests per window (default 120 req / 60s).
 - **Strict limiter**: `RATE_LIMIT_STRICT_MAX` requests per window (default 20 req / 60s,
   window `RATE_LIMIT_STRICT_WINDOW_MS`), applied to sensitive routes: `POST /links`,
-  `POST /links/:id/submit`, `POST /links/:id/cash-out`, `POST /links/:id/cash-out/transfer-sent`,
+  `GET /links/:id/pay-options`, `POST /links/:id/submit`, `POST /links/:id/cash-out`, `POST /links/:id/cash-out/transfer-sent`,
   `POST /auth`, and `/api-keys/*`. The same budget is also kept as separate buckets per seller for
   `POST /seller/anchor-auth/challenge`, `POST /seller/anchor-auth` and `PUT /seller/kyc`, and per client
   IP for `POST /anchor-callbacks/*`.
@@ -500,66 +500,8 @@ with `; ` — and is empty when every payment was a plain payment.
 checkout page). The link id is the bearer capability; seller-only detail remains
 behind `GET /links/:id/detail`.
 
-**200** — same shape as the `POST /links` response, plus a `pay` block the
-checkout reads instead of keeping its own copy of the flags:
-```json
-{ "pay": { "pathPayments": true, "maxSlippageBps": 100, "maxPriceImpactBps": 300 } }
-```
-- `pathPayments` — whether this deployment offers paying in another asset.
-- `maxSlippageBps` — the allowance already baked into each option's
-  `maxSourceAmount`.
-- `maxPriceImpactBps` — the cap the wallet builder applies to its build-time
-  re-quote (issue 5.48); `PATH_PAYMENTS_MAX_PRICE_IMPACT_BPS`, default 300.
-
+**200** — same shape as the `POST /links` response.
 **404** — `{ "error": "not_found" }`
-
----
-
-## `GET /links/:id/pay-options`
-
-**Public — no auth.** The assets a buyer could pay this link with instead of the
-link's own asset, quoted for their wallet (issue 4.64). Only meaningful when
-`GET /links/:id` reports `pay.pathPayments: true`; the checkout asks for it once
-the buyer connects their wallet.
-
-`account` is required and must be the buyer's Stellar `G...` address. The quote
-is per account, because which paths exist depends on the assets that account
-can hold.
-
-**200**
-```json
-{
-  "options": [
-    {
-      "asset": { "code": "XLM", "issuer": null },
-      "sourceAmount": "24.12",
-      "maxSourceAmount": "24.3612"
-    }
-  ],
-  "expiresAt": 1750000090000
-}
-```
-
-- `sourceAmount` — what the quote says the buyer sends.
-- `maxSourceAmount` — that amount plus the deployment's slippage allowance
-  (`PATH_PAYMENTS_MAX_SLIPPAGE_BPS`, default 100 = 1%). This is the `sendMax` a
-  path payment carries.
-- `expiresAt` — server epoch ms for the whole set; the checkout re-quotes when it
-  passes. Absent when `options` is empty.
-
-The link's own asset is never listed — the checkout always offers it first.
-Each option costs one Horizon strict-receive quote, and the quote is advisory:
-price impact is enforced when the payment is built, not filtered out here.
-
-An empty `options` list is **not** an error: it means "pay in the link asset".
-That is also the answer when `PATH_PAYMENTS_ENABLED` is off, when the link is not
-`active`/`underpaid`, when the order book has no path, and when Horizon is
-unreachable.
-
-| Status | `error` | When |
-| --- | --- | --- |
-| `400` | `invalid_query` | `account` is missing or not a `G...` address |
-| `404` | `not_found` | No such link |
 
 ---
 
@@ -656,19 +598,90 @@ Fires the `link.cancelled` webhook.
 
 ---
 
+## `GET /links/:id/pay-options?account=G...`
+
+**Public — no auth.** Strict-rate-limited. Which assets the buyer's account can
+pay this link with besides the link's own asset, and how much of each it takes
+right now. The API asks Horizon for strict-receive paths from that account to
+the link's asset, for the link's **outstanding** amount: an underpaid link is
+quoted only what it still owes.
+
+Unavailable while `PATH_PAYMENTS_ENABLED` is off, which is the default.
+
+Only assets in `PATH_PAYMENTS_SOURCE_ASSETS` are offered (default `native`, so
+XLM alone). The link's own asset is never an option: paying with it is a plain
+payment.
+
+**200**
+```json
+{
+  "linkAsset": { "code": "USDC", "issuer": "GA5Z..." },
+  "amount": "10",
+  "options": [
+    {
+      "sourceAsset": { "code": "XLM", "issuer": null },
+      "sourceAmount": "24.1234567",
+      "sendMax": "24.3646913",
+      "path": [],
+      "quotedAt": 1763560000000,
+      "expiresAt": 1763560030000
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `amount` | The outstanding amount, in `linkAsset`. Every option delivers exactly this. |
+| `sourceAmount` | What the path costs now, in `sourceAsset`. |
+| `sendMax` | The most the buyer agrees to spend: `sourceAmount` plus `PATH_PAYMENTS_MAX_SLIPPAGE_BPS`, rounded up to the next stroop. |
+| `path` | The assets traded through between source and destination, in order. Empty for a direct trade. |
+| `quotedAt`, `expiresAt` | Epoch milliseconds. `expiresAt` is `quotedAt` plus `PATH_QUOTE_TTL_MS` (default 30000). Ask again once it has passed. |
+
+`options` is empty when the account holds nothing it may pay with, when there
+is no path, and when the account does not exist on the ledger.
+
+The response carries `Cache-Control: no-store`.
+
+**Errors**
+
+| Status | `error` | When | What to do |
+|---|---|---|---|
+| `400` | `invalid_account` | `account` is missing or is not a G-address | Send the buyer's public key |
+| `404` | `not_found` | Unknown link | Check the id |
+| `409` | `link_not_payable` | The link is not `active` or `underpaid`. `status` holds what it is | Nothing to pay |
+| `501` | `path_payments_disabled` | The feature is switched off on this deployment | Offer the link's own asset only |
+| `502` | `quote_failed` | Horizon refused the path search. `retryable` is `false` | Do not retry as is |
+| `503` | `horizon_unavailable` | Horizon did not answer, or answered 429 or 5xx, after retries. `retryable` is `true` | Retry shortly |
+
+---
+
 ## `POST /links/:id/submit`
 
 **Public — no auth.** The buyer submits a transaction signed by their own wallet.
 The API parses and validates the complete XDR before relaying it to Horizon. It
-accepts exactly one operation — a `payment`, or a `pathPaymentStrictReceive` when
-the buyer pays in another asset (issue 5.48) — and verifies the destination,
-the **delivered** asset and amount, and the required `MEMO_TEXT` against the
-link. For a path payment that means `destAsset`/`destAmount`: what the seller
-receives, which is also what the watcher settles on. `sendMax` and the source
-asset are the buyer's own money and are never compared to the link.
-`pathPaymentStrictSend` is refused — it fixes what is spent, not what arrives.
-It never marks the link paid directly; the ledger watcher remains the source of
-truth.
+accepts exactly one payment operation and verifies the destination, asset, amount,
+and required `MEMO_TEXT` against the link. It never marks the link paid directly;
+the ledger watcher remains the source of truth.
+
+While `PATH_PAYMENTS_ENABLED` is on, the one operation may instead be a
+strict-receive path payment (`path_payment_strict_receive`) built from a
+`GET /links/:id/pay-options` quote. What it delivers is held to the rules of a
+plain payment: `destination`, `destAsset`, `destAmount` (not under the
+outstanding amount), the memo, and no operation-level source. Its source side
+has rules of its own:
+
+- `sendAsset` is on `PATH_PAYMENTS_SOURCE_ASSETS`, and is not the link's asset.
+- `path` holds at most 5 assets.
+- The transaction expires: `timeBounds.maxTime` is set, and is no later than now
+  plus `PATH_QUOTE_TTL_MS` plus 30 seconds.
+- `sendMax` is no more than what the path costs when the transaction is
+  submitted plus twice `PATH_PAYMENTS_MAX_SLIPPAGE_BPS`. The API asks Horizon for
+  that price itself.
+
+A strict-send path payment (`path_payment_strict_send`) is never accepted: it
+fixes what the buyer spends and can deliver less than the link asks for. With
+the switch off none of this applies, and only a plain payment is accepted.
 
 **Request**
 ```json
@@ -681,12 +694,26 @@ truth.
 ```
 
 **400** — malformed XDR, fee-bump envelope, or a transaction containing anything
-other than exactly one payment or strict-receive path payment operation.
+other than exactly one payment operation (or, with path payments on, one
+strict-receive path payment). Also a path payment that sends the link's own
+asset, has no `timeBounds.maxTime`, or expires too late.
 
 **409** — the link is unavailable, or the transaction does not match the link.
 A Horizon rejection returns `{ "error": "payment_rejected", "reason": "...", "detail": "..." }`,
 where `reason` can distinguish `insufficient_balance`, `missing_trustline`, `price_moved`, `no_path`, or a
 generic `payment_rejected`.
+
+A path payment is also refused with 409, before anything reaches Horizon, when:
+
+| `error` | `reason` | When |
+|---|---|---|
+| `Source asset <code> is not accepted for path payments` | `source_asset_not_allowed` | `sendAsset` is not on the allowlist |
+| `payment_rejected` | `no_path` | There is no path from `sendAsset` to the link's asset right now |
+| `payment_rejected` | `price_moved` | `sendMax` is above the limit for what the path costs now. `detail` gives both figures. Get a new quote |
+
+**503** — `{ "error": "horizon_unavailable", "retryable": true }`: Horizon could
+not give the price to check a path payment's `sendMax` against. Nothing was
+relayed.
 
 ---
 

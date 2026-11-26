@@ -10,6 +10,7 @@ import {
   PathPaymentError,
   planPathPayment,
   type PaymentHorizon,
+  type PathPaymentOption,
 } from "../../lib/payment-build";
 import {
   connectWallet,
@@ -52,7 +53,7 @@ class WalletPaymentError extends Error {
 export interface PaymentBuildContext {
   address: string;
   initial: LinkWithRequest;
-  payOption: PayOption | null;
+  payOption: PathPaymentOption | null;
 }
 
 interface Props {
@@ -127,7 +128,10 @@ export default function WalletPayButton({ initial, disabled = false, onSubmitted
       if (pathPayments) {
         // A quote endpoint hiccup must not stop the buyer paying the link
         // asset, so a failure degrades to "no other options".
-        const options = await api.getPayOptions(initial.link.id, address).catch(() => [] as PayOption[]);
+        const options = await api
+          .getPayOptions(initial.link.id, address)
+          .then((body) => body.options)
+          .catch(() => [] as PayOption[]);
         if (options.length > 0) {
           setChoice({ address, link: current, options, selected: null });
           return;
@@ -158,7 +162,7 @@ export default function WalletPayButton({ initial, disabled = false, onSubmitted
     if (!active) return;
     let options: PayOption[];
     try {
-      options = await api.getPayOptions(active.link.link.id, active.address);
+      options = (await api.getPayOptions(active.link.link.id, active.address)).options;
     } catch {
       // A failed re-quote is not "no other assets". Reducing it to an empty
       // list would drop the buyer's chosen asset and quietly point the next
@@ -169,7 +173,9 @@ export default function WalletPayButton({ initial, disabled = false, onSubmitted
     setChoice((prev) => {
       if (!prev) return prev;
       const wanted = prev.selected;
-      const selected = wanted ? options.find((option) => sameAsset(option.asset, wanted.asset)) : undefined;
+      const selected = wanted
+        ? options.find((option) => sameAsset(option.sourceAsset, wanted.sourceAsset))
+        : undefined;
       return { ...prev, options, selected: selected ?? null };
     });
   }, [choice]);
@@ -198,7 +204,7 @@ export default function WalletPayButton({ initial, disabled = false, onSubmitted
         {busy
           ? "Waiting for wallet…"
           : choice
-            ? `Pay with ${choice.selected?.asset.code ?? choice.link.request.asset.code}`
+            ? `Pay with ${choice.selected?.sourceAsset.code ?? choice.link.request.asset.code}`
             : "Pay with wallet"}
       </button>
       {error && (

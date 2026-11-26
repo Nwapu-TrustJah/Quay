@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { NOOP_LOGGER, OffRampDisabledError, type PaymentLink, type Seller, type SellerRepository, type TokenRevocationRepository } from "@checkout/core";
 import type { Container } from "../src/services/container";
 import { SessionIssuer } from "../src/services/session";
@@ -38,7 +38,7 @@ const ownedLink: PaymentLink = {
   updatedAt: Date.now(),
 };
 
-function fakeContainer(over: { payOptions?: Container["payOptions"] } = {}): Container {
+function fakeContainer(): Container {
   const sellersById = new Map([[owner.id, owner], [other.id, other]]);
   const sellers: SellerRepository = {
     findById: async (id) => sellersById.get(id) ?? null,
@@ -107,7 +107,6 @@ function fakeContainer(over: { payOptions?: Container["payOptions"] } = {}): Con
     }),
     start() {},
     stop() {},
-    ...over,
   };
 }
 
@@ -162,79 +161,6 @@ describe("GET /links/:id — public checkout read", () => {
     // The API test env leaves PATH_PAYMENTS_* unset: off, 100 bps slippage,
     // 300 bps of price impact (the cap the wallet builder enforces, 5.48).
     expect(body.pay).toEqual({ pathPayments: false, maxSlippageBps: 100, maxPriceImpactBps: 300 });
-  });
-});
-
-describe("GET /links/:id/pay-options — buyer pay-with quotes (issue 4.64)", () => {
-  // A real, well-formed Stellar account id: the route validates the StrKey.
-  const ACCOUNT = "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN";
-
-  it("returns the quoted options for the buyer's account, with no seller session", async () => {
-    const payOptions = vi.fn(async () => ({
-      options: [
-        { asset: { code: "XLM", issuer: null }, sourceAmount: "24.12", maxSourceAmount: "24.3612" },
-      ],
-      expiresAt: 1_800_000_090_000,
-    }));
-    const app = linkRoutes(fakeContainer({ payOptions }), async (_c, next) => next());
-
-    const res = await app.request(`/${ownedLink.id}/pay-options?account=${ACCOUNT}`);
-
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({
-      options: [
-        { asset: { code: "XLM", issuer: null }, sourceAmount: "24.12", maxSourceAmount: "24.3612" },
-      ],
-      expiresAt: 1_800_000_090_000,
-    });
-    // One port call per request: the quoter fans out to Horizon internally.
-    expect(payOptions).toHaveBeenCalledTimes(1);
-    expect(payOptions).toHaveBeenCalledWith({ link: ownedLink, account: ACCOUNT });
-  });
-
-  it("answers 'link asset only' when path payments are not wired (flag off)", async () => {
-    const app = linkRoutes(fakeContainer(), async (_c, next) => next());
-
-    const res = await app.request(`/${ownedLink.id}/pay-options?account=${ACCOUNT}`);
-
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ options: [] });
-  });
-
-  it.each([
-    ["missing", ""],
-    ["malformed", "?account=not-a-stellar-address"],
-  ])("rejects a %s account with 400 before quoting", async (_label, qs) => {
-    const payOptions = vi.fn(async () => ({ options: [] }));
-    const app = linkRoutes(fakeContainer({ payOptions }), async (_c, next) => next());
-
-    const res = await app.request(`/${ownedLink.id}/pay-options${qs}`);
-
-    expect(res.status).toBe(400);
-    expect(((await res.json()) as Record<string, unknown>).error).toBe("invalid_query");
-    expect(payOptions).not.toHaveBeenCalled();
-  });
-
-  it("returns 404 for an unknown link", async () => {
-    const payOptions = vi.fn(async () => ({ options: [] }));
-    const app = linkRoutes(fakeContainer({ payOptions }), async (_c, next) => next());
-
-    const res = await app.request(`/lnk_missing/pay-options?account=${ACCOUNT}`);
-
-    expect(res.status).toBe(404);
-    expect(payOptions).not.toHaveBeenCalled();
-  });
-
-  it("passes a link that is no longer payable through as an empty list, not an error", async () => {
-    // The quoter decides eligibility (status, expiry, remainder) without asking
-    // Horizon; the route must not turn its empty answer into a 4xx.
-    const payOptions = vi.fn(async () => ({ options: [] }));
-    const app = linkRoutes(fakeContainer({ payOptions }), async (_c, next) => next());
-
-    const res = await app.request(`/${ownedLink.id}/pay-options?account=${ACCOUNT}`);
-
-    expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ options: [] });
   });
 });
 

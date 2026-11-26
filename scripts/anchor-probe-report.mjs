@@ -33,6 +33,15 @@ export function parseFailures(output) {
 /** Which probe flow a failing test belongs to. */
 export function flowOf(failure) {
   const full = failure.path.join(" > ");
+  // Its own workflow (path-payment-probe.yml), but the same reporter: without
+  // this the auto-filed issue would call a broken path payment an anchor flow.
+  if (/path payment/i.test(full) || /path-payment\.live\.test\.ts$/.test(failure.file)) {
+    const stage = full.match(/stage \d+\/\d+ ([a-z-]+)/i)?.[1];
+    return {
+      id: "path-payment",
+      label: `Path payment live probe (paying a USDC link with XLM)${stage ? `, stage "${stage}"` : ""}`,
+    };
+  }
   if (/refund end-to-end/i.test(full) || /refund\.live\.test\.ts$/.test(failure.file)) {
     const stage = full.match(/stage \d+\/\d+ ([a-z-]+)/i)?.[1];
     return { id: "refund", label: `Refund end-to-end probe${stage ? `, stage "${stage}"` : ""}` };
