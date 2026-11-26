@@ -110,6 +110,11 @@ export interface LinkDetail {
   offrampExternalStatus: string | null;
 }
 
+export interface PaidWithItem {
+  asset: { code: string; issuer?: string | null };
+  amount: string;
+}
+
 /** Fields exposed on the public receipt — never includes seller PII. */
 export interface PublicReceipt {
   reference: string;
@@ -120,6 +125,8 @@ export interface PublicReceipt {
   txHash: string | null;
   payer: string | null;
   paidAmount: string | null;
+  /** What the buyer paid with for path payments (issue 5.50 / 4.66). Null for plain payments. */
+  paidWith?: PaidWithItem[] | null;
   createdAt: number;
   updatedAt: number;
 }
