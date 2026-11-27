@@ -20,6 +20,11 @@ export interface LinkWithRequest {
   pay?: { pathPayments: boolean; maxSlippageBps: number };
 }
 
+/** A link row from `GET /links`; paid rows carry refund totals when refunds are on. */
+export interface PaymentLinkWithRefunds extends PaymentLink {
+  refundSummary?: LinkRefundSummary | null;
+}
+
 /** One way to pay a link's outstanding amount with another asset (issue 4.64). */
 export interface PayOption {
   sourceAsset: AssetRef;
@@ -742,7 +747,7 @@ export const api = {
   createLink: (input: CreateLinkInput, idempotencyKey?: string) =>
     http<LinkWithRequest>("/links", { method: "POST", body: JSON.stringify(input), idempotencyKey }),
 
-  listLinks: () => http<{ links: PaymentLink[] }>("/links"),
+  listLinks: () => http<{ links: PaymentLinkWithRefunds[] }>("/links"),
 
   getLink: (id: string) => http<LinkWithRequest>(`/links/${id}`),
 

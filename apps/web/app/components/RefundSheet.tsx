@@ -271,8 +271,7 @@ export default function RefundSheet({
     !amountProblem &&
     !memoProblem &&
     !checkboxProblem &&
-    !walletProblem &&
-    !preflightError;
+    !walletProblem;
 
   const chosenAmount = mode === "full" ? refundable : partAmount.trim();
 
@@ -323,6 +322,10 @@ export default function RefundSheet({
     e.preventDefault();
     setError(null);
     setExpired(false);
+    // The full-amount check may have failed while this smaller amount can still
+    // be received. The confirm path checks the amount being sent, so clear the
+    // old message and let that check decide.
+    setPreflightError(null);
 
     if (!selected) return setError("Choose a payment to refund.");
     if (amountProblem) return setError(amountProblem);
@@ -338,6 +341,7 @@ export default function RefundSheet({
       try {
         const result = await api.refundPreflight(linkId, paymentKey(selected), chosenAmount);
         setPreflight(result);
+        setPreflightError(null);
         requiresMemo = result.memoRequired;
         setMemoRequired(result.memoRequired);
         if (result.memoRequired && !memo.trim()) {

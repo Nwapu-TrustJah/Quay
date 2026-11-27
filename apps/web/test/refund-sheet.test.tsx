@@ -282,6 +282,32 @@ describe("RefundSheet", () => {
     );
   });
 
+  it("lets a valid partial refund proceed when the full-amount preflight fails", async () => {
+    apiMock.refundPreflight.mockImplementation(async (_id: string, _payment: string, amount: string) => {
+      if (amount === "10") {
+        throw new CheckoutError("refund_destination_cannot_receive", 422, "no room", undefined, {
+          message: "The buyer's trustline cannot receive the full amount.",
+        });
+      }
+      return { ok: true, destination: PAYER, memoRequired: false };
+    });
+
+    await open();
+    expect(container.textContent).toContain("cannot receive the full amount");
+
+    await click(container.querySelector('input[value="part"]') as HTMLElement);
+    await type(container.querySelector("#rf-amount") as HTMLInputElement, "4.5");
+    await click(checkbox());
+
+    expect(submit().disabled).toBe(false);
+    await click(submit());
+    expect(apiMock.prepareRefund).toHaveBeenCalledWith(
+      "lnk_1",
+      expect.objectContaining({ payment: `${PAYMENT.txHash}:12345`, amount: "4.5" }),
+      expect.any(String),
+    );
+  });
+
   it("requires the destination checkbox and a memo when the buyer's account needs one", async () => {
     apiMock.refundPreflight.mockResolvedValue({ ok: true, destination: PAYER, memoRequired: true });
     await open();

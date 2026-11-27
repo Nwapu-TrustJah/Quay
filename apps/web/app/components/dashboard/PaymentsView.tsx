@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useEffect, useState, type ReactNode } from "react";
-import { api, type AnchorAuthView, type PaymentLink } from "../../../lib/api";
+import { api, type AnchorAuthView, type PaymentLink, type PaymentLinkWithRefunds } from "../../../lib/api";
 import { shouldShowReconnectHint } from "../../../lib/anchor-session";
 import {
   FILTER_LABEL,
@@ -80,7 +80,7 @@ export function StatusBadge({ link, reconnect }: { link: PaymentLink; reconnect?
   return <span className={`badge badge--${st.tone}`}>{st.label}</span>;
 }
 
-export function PaymentRow({ link, actions }: { link: PaymentLink; actions: RowActions }) {
+export function PaymentRow({ link, actions }: { link: PaymentLinkWithRefunds; actions: RowActions }) {
   const { copied, onCopy, onCashOut, onPendingTransfer, onRefund, cashOutBlocked, anchorAuth, now } = actions;
   const reconnect = shouldShowReconnectHint(link, anchorAuth, {
     offrampEnabled: OFFRAMP_ENABLED,
