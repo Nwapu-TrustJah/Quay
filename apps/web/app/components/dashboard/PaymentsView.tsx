@@ -14,7 +14,8 @@ import {
   relativeTime,
   type PaymentFilter,
 } from "../../../lib/dashboard-metrics";
-import { CASH_OUT_LABEL, OFFRAMP_CURRENCY, OFFRAMP_ENABLED, OFFRAMP_IS_MOCK } from "./config";
+import { hasRefundableAmount } from "../../../lib/refunds";
+import { CASH_OUT_LABEL, OFFRAMP_CURRENCY, OFFRAMP_ENABLED, OFFRAMP_IS_MOCK, REFUNDS_ENABLED } from "./config";
 import { CheckIcon, CopyIcon, PlusIcon } from "./icons";
 
 export interface RowActions {
@@ -22,6 +23,8 @@ export interface RowActions {
   onCopy: (id: string) => void;
   onCashOut: (id: string) => void;
   onPendingTransfer: (id: string) => void;
+  /** Opens the refund sheet for a link that still has money to return. */
+  onRefund?: (id: string) => void;
   cashOutBlocked: boolean;
   anchorAuth: AnchorAuthView | null;
   now: number;
@@ -78,12 +81,13 @@ export function StatusBadge({ link, reconnect }: { link: PaymentLink; reconnect?
 }
 
 export function PaymentRow({ link, actions }: { link: PaymentLink; actions: RowActions }) {
-  const { copied, onCopy, onCashOut, onPendingTransfer, cashOutBlocked, anchorAuth, now } = actions;
+  const { copied, onCopy, onCashOut, onPendingTransfer, onRefund, cashOutBlocked, anchorAuth, now } = actions;
   const reconnect = shouldShowReconnectHint(link, anchorAuth, {
     offrampEnabled: OFFRAMP_ENABLED,
     isMock: OFFRAMP_IS_MOCK,
   });
   const canCashOut = OFFRAMP_ENABLED && (link.status === "paid" || link.status === "offramp_failed");
+  const canRefund = REFUNDS_ENABLED && Boolean(onRefund) && hasRefundableAmount(link);
   const resumable =
     OFFRAMP_ENABLED && !OFFRAMP_IS_MOCK && link.status === "offramp_pending" && link.offrampStatus === "awaiting_transfer";
 
@@ -115,6 +119,16 @@ export function PaymentRow({ link, actions }: { link: PaymentLink; actions: RowA
           {copied === link.id ? <CheckIcon /> : <CopyIcon />}
           {copied === link.id ? "Copied" : "Copy link"}
         </button>
+        {canRefund && (
+          <button
+            type="button"
+            className="chip"
+            onClick={() => onRefund?.(link.id)}
+            aria-label={`Refund payment for ${link.title}`}
+          >
+            Refund
+          </button>
+        )}
         {canCashOut &&
           (cashOutBlocked ? (
             <span className="prow__note" title="Complete identity verification first">
