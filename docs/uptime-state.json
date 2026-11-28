@@ -3,9 +3,9 @@
     "api": {
       "consecutiveFailures": 1,
       "lastStatus": "down",
-      "lastCheckedAt": "2026-11-27T22:22:37.338Z",
+      "lastCheckedAt": "2026-11-28T04:06:10.830Z",
       "today": {
-        "date": "2026-11-27",
+        "date": "2026-11-28",
         "up": 0,
         "down": 1
       },
@@ -126,9 +126,9 @@
     "web": {
       "consecutiveFailures": 0,
       "lastStatus": "up",
-      "lastCheckedAt": "2026-11-27T22:22:37.454Z",
+      "lastCheckedAt": "2026-11-28T04:06:10.886Z",
       "today": {
-        "date": "2026-11-27",
+        "date": "2026-11-28",
         "up": 1,
         "down": 0
       },
